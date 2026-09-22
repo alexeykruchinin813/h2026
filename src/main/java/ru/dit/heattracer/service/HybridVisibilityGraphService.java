@@ -158,16 +158,20 @@ public class HybridVisibilityGraphService {
                      "WHERE ve.task_id = ? AND ve.cluster_id = ?";
 
         return jdbc.query(sql, (rs, rowNum) -> {
-            byte[] wkb = rs.getBytes("geom_wkb");
-            Geometry geom = new WKBReader(geometryFactory).read(wkb);
-            
-            return new EdgeToValidate(
-                    rs.getLong("id"),
-                    rs.getLong("source_vertex"),
-                    rs.getLong("target_vertex"),
-                    geom,
-                    rs.getObject("source_oks_id") != null ? rs.getLong("source_oks_id") : null
-            );
+            try {
+                byte[] wkb = rs.getBytes("geom_wkb");
+                Geometry geom = new WKBReader(geometryFactory).read(wkb);
+                
+                return new EdgeToValidate(
+                        rs.getLong("id"),
+                        rs.getLong("source_vertex"),
+                        rs.getLong("target_vertex"),
+                        geom,
+                        rs.getObject("source_oks_id") != null ? rs.getLong("source_oks_id") : null
+                );
+            } catch (org.locationtech.jts.io.ParseException e) {
+                throw new RuntimeException("Failed to parse WKB geometry for edge", e);
+            }
         }, taskId, clusterId);
     }
 
@@ -184,9 +188,13 @@ public class HybridVisibilityGraphService {
         Map<Long, Geometry> polygons = new HashMap<>();
         
         jdbc.query(sql, rs -> {
-            byte[] wkb = rs.getBytes("geom_wkb");
-            Geometry geom = new WKBReader(geometryFactory).read(wkb);
-            polygons.put(rs.getLong("feature_id"), geom);
+            try {
+                byte[] wkb = rs.getBytes("geom_wkb");
+                Geometry geom = new WKBReader(geometryFactory).read(wkb);
+                polygons.put(rs.getLong("feature_id"), geom);
+            } catch (org.locationtech.jts.io.ParseException e) {
+                log.warn("Failed to parse WKB geometry for restriction {}", rs.getLong("feature_id"), e);
+            }
         }, taskId);
 
         return polygons;

@@ -176,8 +176,12 @@ public class FastVisibilityGraphService {
         return jdbc.query(
                 "SELECT geom_utm FROM restriction_buffer WHERE task_id = ? AND cluster_id = ?",
                 (rs, rowNum) -> {
-                    byte[] wkb = rs.getBytes("geom_utm");
-                    return new WKBReader(geometryFactory).read(wkb);
+                    try {
+                        byte[] wkb = rs.getBytes("geom_utm");
+                        return new WKBReader(geometryFactory).read(wkb);
+                    } catch (org.locationtech.jts.io.ParseException e) {
+                        throw new RuntimeException("Failed to parse WKB geometry", e);
+                    }
                 },
                 taskId, clusterId);
     }
