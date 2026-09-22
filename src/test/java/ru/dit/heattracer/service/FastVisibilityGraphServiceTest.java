@@ -119,9 +119,9 @@ class FastVisibilityGraphServiceTest {
         );
 
         List<FastVisibilityGraphService.Vertex> corners = Arrays.asList(
-            service.new Vertex(1L, 0.0, 0.0, FastVisibilityGraphService.VertexType.CORNER),
-            service.new Vertex(2L, 50.0, 0.0, FastVisibilityGraphService.VertexType.CORNER), // 50м
-            service.new Vertex(3L, 150.0, 0.0, FastVisibilityGraphService.VertexType.CORNER) // 150м (> R_MAX)
+            new FastVisibilityGraphService.Vertex(1L, 0.0, 0.0, FastVisibilityGraphService.VertexType.CORNER),
+            new FastVisibilityGraphService.Vertex(2L, 50.0, 0.0, FastVisibilityGraphService.VertexType.CORNER), // 50м
+            new FastVisibilityGraphService.Vertex(3L, 150.0, 0.0, FastVisibilityGraphService.VertexType.CORNER) // 150м (> R_MAX)
         );
 
         List<FastVisibilityGraphService.Edge> edges = new ArrayList<>();
@@ -154,12 +154,12 @@ class FastVisibilityGraphServiceTest {
         );
 
         List<FastVisibilityGraphService.Vertex> oksList = Arrays.asList(
-            service.new Vertex(1L, 0.0, 0.0, FastVisibilityGraphService.VertexType.OKS)
+            new FastVisibilityGraphService.Vertex(1L, 0.0, 0.0, FastVisibilityGraphService.VertexType.OKS)
         );
 
         List<FastVisibilityGraphService.Vertex> candidateList = Arrays.asList(
-            service.new Vertex(2L, 500.0, 0.0, FastVisibilityGraphService.VertexType.CANDIDATE), // 500м
-            service.new Vertex(3L, 1500.0, 0.0, FastVisibilityGraphService.VertexType.CANDIDATE) // 1500м (> R_MAX)
+            new FastVisibilityGraphService.Vertex(2L, 500.0, 0.0, FastVisibilityGraphService.VertexType.CANDIDATE), // 500м
+            new FastVisibilityGraphService.Vertex(3L, 1500.0, 0.0, FastVisibilityGraphService.VertexType.CANDIDATE) // 1500м (> R_MAX)
         );
 
         List<FastVisibilityGraphService.Edge> edges = new ArrayList<>();
@@ -183,10 +183,14 @@ class FastVisibilityGraphServiceTest {
     @DisplayName("Пакетная вставка рёбер работает корректно")
     void testBatchInsert() {
         UUID taskId = UUID.randomUUID();
+        
+        // Создаём сервис для теста
+        FastVisibilityGraphService service = new FastVisibilityGraphService(jdbcTemplate);
+        
         List<FastVisibilityGraphService.Edge> edges = Arrays.asList(
-            service.new Edge(1L, 2L, 100.0),
-            service.new Edge(2L, 3L, 200.0),
-            service.new Edge(3L, 4L, 300.0)
+            new FastVisibilityGraphService.Edge(1L, 2L, 100.0),
+            new FastVisibilityGraphService.Edge(2L, 3L, 200.0),
+            new FastVisibilityGraphService.Edge(3L, 4L, 300.0)
         );
 
         // Создаём тестовую запись задачи
