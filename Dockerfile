@@ -5,9 +5,11 @@ WORKDIR /app
 # Копируем settings.xml с зеркалом Huawei
 COPY settings.xml /root/.m2/settings.xml
 
+# Копируем только pom.xml и скачиваем зависимости (кэшируется)
 COPY pom.xml .
 RUN mvn dependency:go-offline -s /root/.m2/settings.xml
 
+# Копируем исходный код и собираем приложение
 COPY src ./src
 RUN mvn clean package -DskipTests -s /root/.m2/settings.xml
 
