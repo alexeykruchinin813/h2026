@@ -1,0 +1,39 @@
+services:
+  # Сервис с базой данных PostGIS + pgRouting
+  db:
+    image: nickblah/pgrouting:16-postgis-3.6-pgrouting-4.0.1
+    container_name: heat-tracer-db
+    environment:
+      POSTGRES_USER: heat_user
+      POSTGRES_PASSWORD: heat_password
+      POSTGRES_DB: heat_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U heat_user -d heat_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Сервис с вашим Java-приложением
+  app:
+    build: .
+    container_name: heat-tracer-app
+    ports:
+      - "8080:8080"
+    environment:
+      # Переменные для подключения к БД (используйте их в application.properties)
+      SPRING_DATASOURCE_URL: jdbc:postgresql://db:5432/heat_db
+      SPRING_DATASOURCE_USERNAME: heat_user
+      SPRING_DATASOURCE_PASSWORD: heat_password
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+# Именованный том для сохранения данных БД между перезапусками
+volumes:
+  pgdata:

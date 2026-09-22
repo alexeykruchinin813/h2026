@@ -1,0 +1,125 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <!-- Родитель Spring Boot: задаёт версии всех стандартных зависимостей -->
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>2.6.3</version>
+        <relativePath/>
+    </parent>
+
+    <groupId>ru.dit.heattracer</groupId>
+    <artifactId>heat-tracer</artifactId>
+    <version>1.0-SNAPSHOT</version>
+    <name>heat-tracer</name>
+    <description>Сервис моделирования трасс подключения к тепловым сетям</description>
+
+    <properties>
+        <java.version>11</java.version>
+        <maven.compiler.source>11</maven.compiler.source>
+        <maven.compiler.target>11</maven.compiler.target>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+
+        <!-- Версии сторонних библиотек -->
+        <jts.version>1.19.0</jts.version>
+        <proj4j.version>1.2.2</proj4j.version>
+        <jgrapht.version>1.5.3</jgrapht.version>
+        <springdoc.version>1.7.0</springdoc.version>
+    </properties>
+
+    <dependencies>
+        <!-- ============ Spring Boot ============ -->
+
+        <!-- REST API (Spring MVC, Jackson, Tomcat) -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+
+        <!-- Валидация входных DTO (@Valid, @NotNull и т.п.) -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-validation</artifactId>
+        </dependency>
+
+        <!-- ============ Документация API ============ -->
+
+        <!-- Swagger UI для Spring Boot 2.6.x -->
+        <dependency>
+            <groupId>org.springdoc</groupId>
+            <artifactId>springdoc-openapi-ui</artifactId>
+            <version>1.7.0</version>
+        </dependency>
+
+        <!-- ============ Геометрия ============ -->
+
+        <!-- JTS Topology Suite: геометрические операции, STRtree, буферы -->
+        <dependency>
+            <groupId>org.locationtech.jts</groupId>
+            <artifactId>jts-core</artifactId>
+            <version>${jts.version}</version>
+        </dependency>
+
+        <!-- proj4j: преобразование координат EPSG:4326 <-> EPSG:32637 -->
+        <dependency>
+            <groupId>org.locationtech.proj4j</groupId>
+            <artifactId>proj4j</artifactId>
+            <version>${proj4j.version}</version>
+        </dependency>
+
+        <!-- proj4j-epsg: база данных проекций EPSG -->
+        <dependency>
+            <groupId>org.locationtech.proj4j</groupId>
+            <artifactId>proj4j-epsg</artifactId>
+            <version>${proj4j.version}</version>
+        </dependency>
+
+        <!-- ============ Графы ============ -->
+
+        <!-- JGraphT: A*, Dijkstra, MST, Steiner tree -->
+        <dependency>
+            <groupId>org.jgrapht</groupId>
+            <artifactId>jgrapht-core</artifactId>
+            <version>${jgrapht.version}</version>
+        </dependency>
+
+        <!-- ============ Тесты (по желанию, можно удалить) ============ -->
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-core</artifactId>
+        </dependency>
+
+        <!-- Spring JDBC: JdbcTemplate, DataSource, транзакции -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-jdbc</artifactId>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <!-- Плагин Spring Boot: позволяет запускать приложение как java -jar -->
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+
+</project>

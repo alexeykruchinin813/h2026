@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<settings xmlns="http://maven.apache.org/SETTINGS/1.0.0">
+    <mirrors>
+    <mirror>
+        <id>huawei</id>
+        <name>Huawei Cloud Maven</name>
+        <url>https://repo.huaweicloud.com/repository/maven/</url>
+        <mirrorOf>central</mirrorOf>
+    </mirror>
+</mirrors>
+<profiles>
+        <profile>
+            <id>long-timeouts</id>
+            <activation>
+                <activeByDefault>true</activeByDefault>
+            </activation>
+            <properties>
+                <maven.wagon.http.connectionTimeout>180000</maven.wagon.http.connectionTimeout>
+                <maven.wagon.http.readTimeout>180000</maven.wagon.http.readTimeout>
+                <maven.wagon.httpconnectionManager.ttlSeconds>300</maven.wagon.httpconnectionManager.ttlSeconds>
+            </properties>
+        </profile>
+    </profiles>
+</settings>
