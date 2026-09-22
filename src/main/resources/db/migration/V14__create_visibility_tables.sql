@@ -1,5 +1,8 @@
 -- D1. Visibility graph tables
 
+-- Drop old visibility_edge table from V5 if exists (has different structure)
+DROP TABLE IF EXISTS visibility_edge CASCADE;
+
 CREATE TABLE IF NOT EXISTS visibility_vertex (
     id              BIGSERIAL PRIMARY KEY,
     task_id         UUID NOT NULL,
