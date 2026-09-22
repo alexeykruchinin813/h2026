@@ -12,6 +12,12 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
+import org.testcontainers.containers.PostgreSQLContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
+import org.testcontainers.utility.DockerImageName;
 
 import java.util.*;
 
@@ -20,16 +26,32 @@ import static org.junit.jupiter.api.Assertions.*;
 /**
  * Тесты для FastVisibilityGraphService с JTS STRtree.
  * 
- * Проверяют:
- * 1. Корректность построения STRtree
- * 2. Проверку видимости между вершинами
- * 3. Производительность по сравнению с SQL-версией
- * 4. Соответствие рёбер требованиям R_MAX
+ * Используют Testcontainers для поднятия изолированного PostgreSQL с PostGIS и pgRouting.
+ * Каждый тест запускается в чистой базе данных.
  */
+@Testcontainers
 @SpringBootTest
 @ActiveProfiles("test")
 @DisplayName("FastVisibilityGraphService тесты")
 class FastVisibilityGraphServiceTest {
+
+    // Образ PostgreSQL с PostGIS и pgRouting
+    @Container
+    static final PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(
+            DockerImageName.parse("nickblah/pgrouting:16-postgis-3.6-pgrouting-4.0.1")
+    ).withDatabaseName("testdb")
+      .withUsername("test")
+      .withPassword("test");
+
+    @DynamicPropertySource
+    static void overrideProps(DynamicPropertyRegistry registry) {
+        registry.add("spring.datasource.url", postgres::getJdbcUrl);
+        registry.add("spring.datasource.username", postgres::getUsername);
+        registry.add("spring.datasource.password", postgres::getPassword);
+        registry.add("spring.datasource.driver-class-name", () -> "org.postgresql.Driver");
+        registry.add("spring.flyway.enabled", () -> "true");
+        registry.add("spring.flyway.locations", () -> "classpath:db/migration");
+    }
 
     @Autowired
     private JdbcTemplate jdbcTemplate;
