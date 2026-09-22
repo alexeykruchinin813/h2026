@@ -2,11 +2,13 @@ package ru.dit.heattracer.service;
 
 import org.locationtech.jts.geom.*;
 import org.locationtech.jts.index.strtree.STRtree;
+import org.locationtech.jts.io.WKBReader;
 import org.locationtech.jts.operation.buffer.BufferOp;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
+import ru.dit.heattracer.model.VisibilityGraphResult;
 
 import java.util.*;
 import java.util.stream.Collectors;
