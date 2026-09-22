@@ -26,7 +26,8 @@ CREATE TABLE IF NOT EXISTS visibility_edge (
     special_k       NUMERIC(6,3),
     crossings       JSONB,
     cost            NUMERIC(12,3) NOT NULL,
-    reverse_cost    NUMERIC(12,3) NOT NULL
+    reverse_cost    NUMERIC(12,3) NOT NULL,
+    attributes      JSONB DEFAULT '{}'::jsonb
 );
 
 CREATE INDEX IF NOT EXISTS idx_ve_task_cluster ON visibility_edge(task_id, cluster_id);
