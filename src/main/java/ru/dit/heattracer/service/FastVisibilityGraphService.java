@@ -5,6 +5,7 @@ import org.locationtech.jts.index.strtree.STRtree;
 import org.locationtech.jts.io.WKBReader;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 import ru.dit.heattracer.model.VisibilityGraphResult;
@@ -36,6 +37,7 @@ public class FastVisibilityGraphService {
     private int maxCorners = 400;             // максимум углов на кластер
     private double simplifyTolerance = 2.0;   // ST_SimplifyPreserveTopology tolerance
 
+    @Autowired
     public FastVisibilityGraphService(JdbcTemplate jdbc) {
         this.jdbc = jdbc;
     }
