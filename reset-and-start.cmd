@@ -23,19 +23,23 @@ REM 3. Очистка таблицы миграций Flyway в базе дан�
 REM    Это критично, так как мы изменили структуру старых миграций (V14, V27)
 echo [3/5] Cleaning Flyway migration history in database...
 docker compose up -d db
-timeout /t 5 /nobreak >nul
+echo Waiting for DB to start (8 seconds)...
+timeout /t 8 /nobreak >nul
 
-REM    Выполняем SQL команду для очистки таблицы flyway_schema_history
-docker compose exec -T db psql -U postgres -d heat_tracer -c "DELETE FROM flyway_schema_history;"
+REM    Используем правильные учётные данные из docker-compose.yml: heat_user / heat_db
+docker compose exec -T db psql -U heat_user -d heat_db -c "DELETE FROM flyway_schema_history;"
 if %errorlevel% neq 0 (
-    echo WARNING: Could not clean flyway_schema_history. Database might not be ready yet.
-    echo Retrying in 5 seconds...
+    echo WARNING: Could not clean flyway_schema_history. Retrying in 5 seconds...
     timeout /t 5 /nobreak >nul
-    docker compose exec -T db psql -U postgres -d heat_tracer -c "DELETE FROM flyway_schema_history;"
+    docker compose exec -T db psql -U heat_user -d heat_db -c "DELETE FROM flyway_schema_history;"
 )
 
-REM    Опционально: удаление всех данных, если нужно полностью чистое состояние
-REM    docker compose exec -T db psql -U postgres -d heat_tracer -c "TRUNCATE TABLE visibility_edge, visibility_vertex, input_feature RESTART IDENTITY CASCADE;"
+REM    Удаляем основные таблицы, чтобы миграции применились с нуля
+echo Dropping existing tables...
+docker compose exec -T db psql -U heat_user -d heat_db -c "DROP TABLE IF EXISTS visibility_edge CASCADE;"
+docker compose exec -T db psql -U heat_user -d heat_db -c "DROP TABLE IF EXISTS visibility_vertex CASCADE;"
+docker compose exec -T db psql -U heat_user -d heat_db -c "DROP TABLE IF EXISTS input_feature CASCADE;"
+docker compose exec -T db psql -U heat_user -d heat_db -c "DROP TABLE IF EXISTS restriction_rules CASCADE;"
 
 REM 4. Сборка нового образа приложения
 echo [4/5] Building Docker image (app)...
