@@ -21,25 +21,21 @@ docker rmi heat-tracer-app 2>nul || echo (Image not found, skipping removal)
 
 REM 3. Очистка таблицы миграций Flyway в базе данных
 REM    Это критично, так как мы изменили структуру старых миграций (V14, V27)
-echo [3/5] Cleaning Flyway migration history in database...
+echo [3/5] Cleaning Flyway migration history and dropping all tables...
 docker compose up -d db
 echo Waiting for DB to start (8 seconds)...
 timeout /t 8 /nobreak >nul
 
 REM    Используем правильные учётные данные из docker-compose.yml: heat_user / heat_db
-docker compose exec -T db psql -U heat_user -d heat_db -c "DELETE FROM flyway_schema_history;"
-if %errorlevel% neq 0 (
-    echo WARNING: Could not clean flyway_schema_history. Retrying in 5 seconds...
-    timeout /t 5 /nobreak >nul
-    docker compose exec -T db psql -U heat_user -d heat_db -c "DELETE FROM flyway_schema_history;"
-)
-
-REM    Удаляем основные таблицы, чтобы миграции применились с нуля
-echo Dropping existing tables...
+REM    Удаляем таблицу flyway_schema_history и все основные таблицы
+docker compose exec -T db psql -U heat_user -d heat_db -c "DROP TABLE IF EXISTS flyway_schema_history CASCADE;"
 docker compose exec -T db psql -U heat_user -d heat_db -c "DROP TABLE IF EXISTS visibility_edge CASCADE;"
 docker compose exec -T db psql -U heat_user -d heat_db -c "DROP TABLE IF EXISTS visibility_vertex CASCADE;"
 docker compose exec -T db psql -U heat_user -d heat_db -c "DROP TABLE IF EXISTS input_feature CASCADE;"
 docker compose exec -T db psql -U heat_user -d heat_db -c "DROP TABLE IF EXISTS restriction_rules CASCADE;"
+docker compose exec -T db psql -U heat_user -d heat_db -c "DROP TABLE IF EXISTS task CASCADE;"
+docker compose exec -T db psql -U heat_user -d heat_db -c "DROP TABLE IF EXISTS path_result CASCADE;"
+docker compose exec -T db psql -U heat_user -d heat_db -c "DROP TABLE IF EXISTS cluster_analysis CASCADE;"
 
 REM 4. Сборка нового образа приложения
 echo [4/5] Building Docker image (app)...
