@@ -104,23 +104,32 @@ $$ LANGUAGE plpgsql;
 
 -- Mark edges for JTS re-validation
 -- Sets flag needs_jts_validation = TRUE for edges crossing OKS buffers
-UPDATE visibility_edge ve
-SET attributes = jsonb_set(
-    COALESCE(ve.attributes, '{}'::jsonb),
-    '{needs_jts_validation}',
-    'true'::jsonb
-)
-FROM visibility_vertex sv,
-     visibility_vertex tv,
-     input_feature r
-WHERE ve.source_vertex = sv.id
-  AND ve.target_vertex = tv.id
-  AND sv.task_id = tv.task_id
-  AND sv.task_id = r.task_id
-  AND r.object_type = 'restriction'
-  AND r.properties->>'restriction_type' = 'oks'
-  AND ST_Intersects(ve.geom, ST_Buffer(r.geom_utm, 1.0))
-  AND r.feature_id IS DISTINCT FROM sv.own_polygon_id;
+-- Only execute if attributes column exists
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns 
+        WHERE table_name = 'visibility_edge' AND column_name = 'attributes'
+    ) THEN
+        UPDATE visibility_edge ve
+        SET attributes = jsonb_set(
+            COALESCE(ve.attributes, '{}'::jsonb),
+            '{needs_jts_validation}',
+            'true'::jsonb
+        )
+        FROM visibility_vertex sv,
+             visibility_vertex tv,
+             input_feature r
+        WHERE ve.source_vertex = sv.id
+          AND ve.target_vertex = tv.id
+          AND sv.task_id = tv.task_id
+          AND sv.task_id = r.task_id
+          AND r.object_type = 'restriction'
+          AND r.properties->>'restriction_type' = 'oks'
+          AND ST_Intersects(ve.geom, ST_Buffer(r.geom_utm, 1.0))
+          AND r.feature_id IS DISTINCT FROM sv.own_polygon_id;
+    END IF;
+END $$;
 
 COMMENT ON FUNCTION create_escape_points IS
 'Creates escape points on OKS buffer boundary (6m = 5m + 1m margin).

@@ -2,6 +2,7 @@ package ru.dit.heattracer.service;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 import ru.dit.heattracer.model.GraphResult;
@@ -15,6 +16,7 @@ public class GraphService {
 
     private final JdbcTemplate jdbc;
 
+    @Autowired
     public GraphService(JdbcTemplate jdbc) {
         this.jdbc = jdbc;
     }

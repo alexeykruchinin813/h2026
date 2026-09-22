@@ -1,5 +1,8 @@
 -- D1. Visibility graph tables
 
+-- Drop old visibility_edge table from V5 if exists (has different structure)
+DROP TABLE IF EXISTS visibility_edge CASCADE;
+
 CREATE TABLE IF NOT EXISTS visibility_vertex (
     id              BIGSERIAL PRIMARY KEY,
     task_id         UUID NOT NULL,
@@ -26,7 +29,8 @@ CREATE TABLE IF NOT EXISTS visibility_edge (
     special_k       NUMERIC(6,3),
     crossings       JSONB,
     cost            NUMERIC(12,3) NOT NULL,
-    reverse_cost    NUMERIC(12,3) NOT NULL
+    reverse_cost    NUMERIC(12,3) NOT NULL,
+    attributes      JSONB DEFAULT '{}'::jsonb
 );
 
 CREATE INDEX IF NOT EXISTS idx_ve_task_cluster ON visibility_edge(task_id, cluster_id);
