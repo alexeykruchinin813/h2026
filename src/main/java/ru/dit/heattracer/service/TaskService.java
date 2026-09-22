@@ -198,25 +198,35 @@ public class TaskService {
             state.setPercent(87);
             state.setStage("TIE_IN_FOUND");
 
-            // ===== 6. ПОСТРОЕНИЕ ГРАФА ВИДИМОСТИ (D1) =====
+            // ===== 6. ПОСТРОЕНИЕ ГРАФА ВИДИМОСТИ (D1) — ПАРАЛЛЕЛЬНО ПО КЛАСТЕРАМ =====
             state.setStage("BUILDING_VISIBILITY");
             state.setPercent(88);
 
-            for (OksCluster cluster : clusters) {
-                // E1: подбор предварительного ДУ по суммарному расходу кластера
-                DiameterSpec provisionalSpec = diameterPicker.pickForFlow(cluster.getTotalFlow());
-                int provisionalDiameter = provisionalSpec.getDiameter();
+            // Параллельная обработка кластеров (OPTIMIZATION: parallel stream)
+            int clusterCount = clusters.size();
+            log.info("[{}] Building visibility graphs for {} clusters in parallel...", id, clusterCount);
 
-                log.info("[{}] Cluster {}: provisional {} for flow {} т/ч",
-                        id, cluster.getClusterId(),
-                        provisionalSpec, cluster.getTotalFlow());
+            clusters.parallelStream().forEach(cluster -> {
+                try {
+                    // E1: подбор предварительного ДУ по суммарному расходу кластера
+                    DiameterSpec provisionalSpec = diameterPicker.pickForFlow(cluster.getTotalFlow());
+                    int provisionalDiameter = provisionalSpec.getDiameter();
 
-                VisibilityGraphResult vg = visibilityGraphService.build(
-                        id, cluster.getClusterId(), provisionalDiameter);
+                    log.info("[{}] Cluster {}: provisional {} for flow {} т/ч",
+                            id, cluster.getClusterId(),
+                            provisionalSpec, cluster.getTotalFlow());
 
-                log.info("[{}] Cluster {}: {}",
-                        id, cluster.getClusterId(), vg);
-            }
+                    VisibilityGraphResult vg = visibilityGraphService.build(
+                            id, cluster.getClusterId(), provisionalDiameter);
+
+                    log.info("[{}] Cluster {}: {}",
+                            id, cluster.getClusterId(), vg);
+                } catch (Exception e) {
+                    log.error("[{}] Cluster {}: visibility graph build failed",
+                            id, cluster.getClusterId(), e);
+                    throw e; // Re-throw to fail the task
+                }
+            });
 
             state.setPercent(90);
             state.setStage("VISIBILITY_BUILT");
