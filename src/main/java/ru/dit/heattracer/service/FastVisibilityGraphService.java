@@ -343,4 +343,20 @@ public class FastVisibilityGraphService {
             this.length = length;
         }
     }
+
+    // ===== Методы для тестирования (package-private) =====
+
+    /**
+     * Создаёт STRtree для тестирования
+     */
+    STRtree buildSTRtreeForTest(List<Geometry> geometries) {
+        return buildSTRtree(geometries);
+    }
+
+    /**
+     * Проверяет видимость для тестирования
+     */
+    boolean isVisibleForTest(LineString line, STRtree tree) {
+        return isVisible(line, tree);
+    }
 }
