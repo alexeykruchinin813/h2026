@@ -51,6 +51,7 @@ public class TaskService {
     private final ClusterService clusterService;
     private final TieInService tieInService;
     private final VisibilityGraphService visibilityGraphService;
+    private final HybridVisibilityGraphService hybridVisibilityGraphService;
     private final PathFinderService pathFinderService;
     private final DiameterPicker diameterPicker;
 
@@ -67,6 +68,7 @@ public class TaskService {
             ClusterService clusterService,
             TieInService tieInService,
             VisibilityGraphService visibilityGraphService,
+            HybridVisibilityGraphService hybridVisibilityGraphService,
             PathFinderService pathFinderService,
             DiameterPicker diameterPicker) throws IOException {
         this.calcExecutor = calcExecutor;
@@ -81,6 +83,7 @@ public class TaskService {
         this.clusterService = clusterService;
         this.tieInService = tieInService;
         this.visibilityGraphService = visibilityGraphService;
+        this.hybridVisibilityGraphService = hybridVisibilityGraphService;
         this.pathFinderService = pathFinderService;
         this.diameterPicker = diameterPicker;
         Files.createDirectories(storageRoot);
@@ -198,25 +201,38 @@ public class TaskService {
             state.setPercent(87);
             state.setStage("TIE_IN_FOUND");
 
-            // ===== 6. ПОСТРОЕНИЕ ГРАФА ВИДИМОСТИ (D1) =====
+            // ===== 6. ПОСТРОЕНИЕ ГРАФА ВИДИМОСТИ (D1) — ПАРАЛЛЕЛЬНО ПО КЛАСТЕРАМ =====
             state.setStage("BUILDING_VISIBILITY");
             state.setPercent(88);
 
-            for (OksCluster cluster : clusters) {
-                // E1: подбор предварительного ДУ по суммарному расходу кластера
-                DiameterSpec provisionalSpec = diameterPicker.pickForFlow(cluster.getTotalFlow());
-                int provisionalDiameter = provisionalSpec.getDiameter();
+            // Параллельная обработка кластеров (OPTIMIZATION: parallel stream)
+            // Используем гибридный подход (SQL + JTS) для решения проблемы связности в плотной застройке
+            int clusterCount = clusters.size();
+            log.info("[{}] Building hybrid visibility graphs for {} clusters in parallel...", id, clusterCount);
 
-                log.info("[{}] Cluster {}: provisional {} for flow {} т/ч",
-                        id, cluster.getClusterId(),
-                        provisionalSpec, cluster.getTotalFlow());
+            clusters.parallelStream().forEach(cluster -> {
+                try {
+                    // E1: подбор предварительного ДУ по суммарному расходу кластера
+                    DiameterSpec provisionalSpec = diameterPicker.pickForFlow(cluster.getTotalFlow());
+                    int provisionalDiameter = provisionalSpec.getDiameter();
 
-                VisibilityGraphResult vg = visibilityGraphService.build(
-                        id, cluster.getClusterId(), provisionalDiameter);
+                    log.info("[{}] Cluster {}: provisional {} for flow {} т/ч",
+                            id, cluster.getClusterId(),
+                            provisionalSpec, cluster.getTotalFlow());
 
-                log.info("[{}] Cluster {}: {}",
-                        id, cluster.getClusterId(), vg);
-            }
+                    // HYBRID APPROACH: SQL coarse graph + JTS validation against individual polygons
+                    // Решает проблему разорванного графа при слиянии буферов OKS
+                    VisibilityGraphResult vg = hybridVisibilityGraphService.buildHybrid(
+                            id, cluster.getClusterId(), provisionalDiameter);
+
+                    log.info("[{}] Cluster {}: {}",
+                            id, cluster.getClusterId(), vg);
+                } catch (Exception e) {
+                    log.error("[{}] Cluster {}: visibility graph build failed",
+                            id, cluster.getClusterId(), e);
+                    throw e; // Re-throw to fail the task
+                }
+            });
 
             state.setPercent(90);
             state.setStage("VISIBILITY_BUILT");

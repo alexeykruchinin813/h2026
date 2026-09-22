@@ -64,6 +64,13 @@
             <version>${jts.version}</version>
         </dependency>
 
+        <!-- JTS IO: WKBReader, WKTWriter для сериализации геометрий -->
+        <dependency>
+            <groupId>org.locationtech.jts.io</groupId>
+            <artifactId>jts-io-common</artifactId>
+            <version>${jts.version}</version>
+        </dependency>
+
         <!-- proj4j: преобразование координат EPSG:4326 <-> EPSG:32637 -->
         <dependency>
             <groupId>org.locationtech.proj4j</groupId>
@@ -109,6 +116,16 @@
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-jdbc</artifactId>
+        </dependency>
+
+        <!-- ============ Утилиты ============ -->
+
+        <!-- Lombok: автоматическая генерация геттеров, сеттеров, конструкторов -->
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <version>1.18.24</version>
+            <scope>provided</scope>
         </dependency>
     </dependencies>
 
