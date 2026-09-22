@@ -57,7 +57,7 @@ echo.
 echo ============================================================
 echo   Done! Services are starting.
 echo   To view logs: docker compose logs -f app
-echo   To check DB status: docker compose exec db psql -U postgres -d heat_tracer -c "SELECT * FROM flyway_schema_history ORDER BY installed_on DESC LIMIT 5;"
+echo   To check DB status: docker compose exec db psql -U heat_user -d heat_db -c "SELECT * FROM flyway_schema_history ORDER BY installed_on DESC LIMIT 5;"
 echo ============================================================
 
 endlocal
