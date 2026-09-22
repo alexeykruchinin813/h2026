@@ -1,28 +1,62 @@
 ```
-# Compiled and build artifacts
-*.pyc
-__pycache__/
-*.class
-*.o
-*.obj
-target/
+# Windows batch files
+*.cmd
+*.bat
 
-# Dependencies
-.venv/
-venv/
-node_modules/
-
-# Logs and temp files
-*.log
-*.tmp
-*.swp
-
-# Environment
+# Environment variables
 .env
 .env.local
 *.env.*
 
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+
 # Editors
 .vscode/
 .idea/
+
+# Dependencies
+node_modules/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+venv/
+env/
+ENV/
+.venv/
+.env/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Build and distribution
+dist/
+build/
+*.egg-info/
+.eggs/
+.installed.cfg
+lib/
+lib64/
+parts/
+sdist/
+develop-eggs/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+.coverage.*
+*.cover
+*.log
+.pytest_cache/
+.mypy_cache/
+.hypothesis/
+.DS_Store
+Thumbs.db
 ```

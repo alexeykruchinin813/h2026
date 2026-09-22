@@ -1,0 +1,59 @@
+@echo off
+setlocal enabledelayedexpansion
+
+echo ============================================================
+echo   Heat Tracer: Full Reset, Rebuild & Start
+echo ============================================================
+echo.
+
+REM 1. Остановка текущих контейнеров
+echo [1/5] Stopping containers...
+docker compose down
+if %errorlevel% neq 0 (
+    echo ERROR: Failed to stop containers.
+    exit /b 1
+)
+
+REM 2. Удаление старых образов (чтобы гарантированно собрать новые)
+echo [2/5] Removing old Docker images...
+docker compose rm -f app
+docker rmi heat-tracer-app 2>nul || echo (Image not found, skipping removal)
+
+REM 3. Очистка таблицы миграций Flyway в базе данных
+REM    Это критично, так как мы изменили структуру старых миграций (V14, V27)
+echo [3/5] Cleaning Flyway migration history in database...
+docker compose up -d db
+timeout /t 5 /nobreak >nul
+
+REM    Выполняем SQL команду для очистки таблицы flyway_schema_history
+docker compose exec -T db psql -U postgres -d heat_tracer -c "DELETE FROM flyway_schema_history;"
+if %errorlevel% neq 0 (
+    echo WARNING: Could not clean flyway_schema_history. Database might not be ready yet.
+    echo Retrying in 5 seconds...
+    timeout /t 5 /nobreak >nul
+    docker compose exec -T db psql -U postgres -d heat_tracer -c "DELETE FROM flyway_schema_history;"
+)
+
+REM    Опционально: удаление всех данных, если нужно полностью чистое состояние
+REM    docker compose exec -T db psql -U postgres -d heat_tracer -c "TRUNCATE TABLE visibility_edge, visibility_vertex, input_feature RESTART IDENTITY CASCADE;"
+
+REM 4. Сборка нового образа приложения
+echo [4/5] Building Docker image (app)...
+docker compose build --no-cache app
+if %errorlevel% neq 0 (
+    echo ERROR: Docker build failed.
+    exit /b 1
+)
+
+REM 5. Запуск всех сервисов
+echo [5/5] Starting all services...
+docker compose up -d
+
+echo.
+echo ============================================================
+echo   Done! Services are starting.
+echo   To view logs: docker compose logs -f app
+echo   To check DB status: docker compose exec db psql -U postgres -d heat_tracer -c "SELECT * FROM flyway_schema_history ORDER BY installed_on DESC LIMIT 5;"
+echo ============================================================
+
+endlocal
