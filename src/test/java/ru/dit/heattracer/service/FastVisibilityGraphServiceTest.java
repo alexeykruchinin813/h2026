@@ -36,21 +36,27 @@ import static org.junit.jupiter.api.Assertions.*;
 class FastVisibilityGraphServiceTest {
 
     static {
-        // Fail-fast: понятное сообщение вместо "ExceptionInInitializerError",
-        // если Docker недоступен (не запущен Docker Desktop, нет прав, устаревший docker-java)
+        // Fail-fast: полное сообщение об причине вместо безликого "ExceptionInInitializerError".
+        // Surefire по умолчанию обрезает стектрейсы — здесь печатаем причину целиком в stdout.
         try {
             if (!DockerClientFactory.instance().isDockerAvailable()) {
                 throw new IllegalStateException(
-                    "Docker недоступен. Проверьте, что Docker Desktop / WSL2 запущен " +
-                    "(docker info должен работать).");
+                    "Docker недоступен. Проверьте, что Docker Desktop запущен и доступен " +
+                    "tcp://localhost:2375 (Settings -> General -> Expose daemon on tcp://localhost:2375 without TLS), " +
+                    "либо задайте DOCKER_HOST. См. src/test/resources/testcontainers.properties.");
             }
-        } catch (IllegalStateException e) {
-            throw e;
         } catch (Throwable t) {
-            throw new IllegalStateException(
-                "Не удалось инициализировать Testcontainers/Docker-клиент: " + t +
-                ". Проверьте запуск Docker Desktop и версию testcontainers (нужна >= 1.20 " +
-                "для Docker Engine 25+).", t);
+            System.err.println("=== Testcontainers/Docker init FAILED ===");
+            Throwable cause = t;
+            while (cause != null) {
+                System.err.println(cause.getClass().getName() + ": " + cause.getMessage());
+                for (StackTraceElement el : Arrays.copyOf(cause.getStackTrace(), Math.min(15, cause.getStackTrace().length))) {
+                    System.err.println("    at " + el);
+                }
+                cause = cause.getCause();
+            }
+            System.err.println("=====================================");
+            throw new IllegalStateException("Не удалось подключиться к Docker: " + t, t);
         }
     }
 

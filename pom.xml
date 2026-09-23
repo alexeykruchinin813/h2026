@@ -178,6 +178,14 @@
 
     <build>
         <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <!-- Не обрезать стектрейсы: иначе причина ExceptionInInitializerError не видна -->
+                    <trimStackTrace>false</trimStackTrace>
+                </configuration>
+            </plugin>
             <!-- Плагин Spring Boot: позволяет запускать приложение как java -jar -->
             <plugin>
                 <groupId>org.springframework.boot</groupId>
