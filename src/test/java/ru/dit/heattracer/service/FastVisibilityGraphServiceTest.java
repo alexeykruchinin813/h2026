@@ -14,6 +14,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.testcontainers.DockerClientFactory;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
@@ -33,6 +34,25 @@ import static org.junit.jupiter.api.Assertions.*;
 @SpringBootTest
 @DisplayName("FastVisibilityGraphService тесты")
 class FastVisibilityGraphServiceTest {
+
+    static {
+        // Fail-fast: понятное сообщение вместо "ExceptionInInitializerError",
+        // если Docker недоступен (не запущен Docker Desktop, нет прав, устаревший docker-java)
+        try {
+            if (!DockerClientFactory.instance().isDockerAvailable()) {
+                throw new IllegalStateException(
+                    "Docker недоступен. Проверьте, что Docker Desktop / WSL2 запущен " +
+                    "(docker info должен работать).");
+            }
+        } catch (IllegalStateException e) {
+            throw e;
+        } catch (Throwable t) {
+            throw new IllegalStateException(
+                "Не удалось инициализировать Testcontainers/Docker-клиент: " + t +
+                ". Проверьте запуск Docker Desktop и версию testcontainers (нужна >= 1.20 " +
+                "для Docker Engine 25+).", t);
+        }
+    }
 
     // Образ PostgreSQL с PostGIS и pgRouting
     @Container
@@ -139,7 +159,6 @@ class FastVisibilityGraphServiceTest {
             new FastVisibilityGraphService.Vertex(2L, 50.0, 0.0, FastVisibilityGraphService.VertexType.CORNER), // 50м
             new FastVisibilityGraphService.Vertex(3L, 150.0, 0.0, FastVisibilityGraphService.VertexType.CORNER) // 150м (> R_MAX)
         );
-
         List<FastVisibilityGraphService.Edge> edges = new ArrayList<>();
         STRtree emptyTree = new STRtree();
 
@@ -196,30 +215,21 @@ class FastVisibilityGraphServiceTest {
     @DisplayName("Пакетная вставка рёбер работает корректно")
     void testBatchInsert() {
         UUID taskId = UUID.randomUUID();
-        
+
         // Создаём тестовую запись задачи
         jdbcTemplate.update(
             "INSERT INTO task (id, status, stage, percent) VALUES (?, 'RUNNING', 'TEST', 0)",
             taskId
         );
 
-        // Вставляем вершины для теста
-        jdbcTemplate.update(
-            "INSERT INTO visibility_vertex (task_id, id, vertex_type, geom_utm) VALUES (?, ?, 'corner', ST_MakePoint(0, 0))",
-            taskId, 1L
-        );
-        jdbcTemplate.update(
-            "INSERT INTO visibility_vertex (task_id, id, vertex_type, geom_utm) VALUES (?, ?, 'corner', ST_MakePoint(100, 0))",
-            taskId, 2L
-        );
-        jdbcTemplate.update(
-            "INSERT INTO visibility_vertex (task_id, id, vertex_type, geom_utm) VALUES (?, ?, 'corner', ST_MakePoint(200, 0))",
-            taskId, 3L
-        );
-        jdbcTemplate.update(
-            "INSERT INTO visibility_vertex (task_id, id, vertex_type, geom_utm) VALUES (?, ?, 'corner', ST_MakePoint(300, 0))",
-            taskId, 4L
-        );
+        // Вставляем вершины для теста (схема: cluster_id NOT NULL, geom GEOMETRY(POINT, 32637))
+        for (int i = 0; i < 4; i++) {
+            jdbcTemplate.update(
+                "INSERT INTO visibility_vertex (id, task_id, cluster_id, vertex_type, geom) " +
+                "VALUES (?, ?, 0, 'polygon_corner', ST_SetSRID(ST_MakePoint(?, 0), 32637))",
+                (long) (i + 1), taskId, (double) (i * 100)
+            );
+        }
 
         List<FastVisibilityGraphService.Edge> edges = Arrays.asList(
             new FastVisibilityGraphService.Edge(1L, 2L, 100.0),

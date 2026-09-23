@@ -94,7 +94,7 @@ public class FastVisibilityGraphService {
 
         // ===== 2. Извлечение forbidden zones и построение STRtree =====
         long startForbidden = System.currentTimeMillis();
-        List<Geometry> forbiddenZones = extractForbiddenZones(taskId, clusterId);
+        List<Geometry> forbiddenZones = extractForbiddenZones(taskId, clusterId, newDiameter);
         STRtree forbiddenTree = buildSTRtree(forbiddenZones);
         long forbiddenElapsed = System.currentTimeMillis() - startForbidden;
 
@@ -130,7 +130,7 @@ public class FastVisibilityGraphService {
     private List<Vertex> extractVertices(UUID taskId, int clusterId, int newDiameter) {
         // Извлекаем OKS вершины
         List<Vertex> oksVertices = jdbc.query(
-                "SELECT id, ST_X(geom_utm) AS x, ST_Y(geom_utm) AS y, 'oks' AS type " +
+                "SELECT id, ST_X(geom) AS x, ST_Y(geom) AS y, 'oks' AS type " +
                 "FROM visibility_vertex WHERE task_id = ? AND cluster_id = ? AND vertex_type = 'oks'",
                 (rs, rowNum) -> new Vertex(
                         rs.getLong("id"),
@@ -141,7 +141,7 @@ public class FastVisibilityGraphService {
 
         // Извлекаем candidate вершины
         List<Vertex> candidateVertices = jdbc.query(
-                "SELECT id, ST_X(geom_utm) AS x, ST_Y(geom_utm) AS y, 'candidate' AS type " +
+                "SELECT id, ST_X(geom) AS x, ST_Y(geom) AS y, 'candidate' AS type " +
                 "FROM visibility_vertex WHERE task_id = ? AND cluster_id = ? AND vertex_type = 'candidate'",
                 (rs, rowNum) -> new Vertex(
                         rs.getLong("id"),
@@ -152,10 +152,10 @@ public class FastVisibilityGraphService {
 
         // Извлекаем corner вершины (с упрощением через ST_SimplifyPreserveTopology)
         List<Vertex> cornerVertices = jdbc.query(
-                "SELECT id, ST_X(ST_SimplifyPreserveTopology(geom_utm, ?)) AS x, " +
-                "       ST_Y(ST_SimplifyPreserveTopology(geom_utm, ?)) AS y, 'corner' AS type " +
-                "FROM visibility_vertex WHERE task_id = ? AND cluster_id = ? AND vertex_type = 'corner' " +
-                "ORDER BY ST_Distance(geom_utm, ST_Centroid(geom_utm)) LIMIT ?",
+                "SELECT id, ST_X(ST_SimplifyPreserveTopology(geom, ?)) AS x, " +
+                "       ST_Y(ST_SimplifyPreserveTopology(geom, ?)) AS y, 'corner' AS type " +
+                "FROM visibility_vertex WHERE task_id = ? AND cluster_id = ? AND vertex_type = 'polygon_corner' " +
+                "ORDER BY ST_Distance(geom, ST_Centroid(geom)) LIMIT ?",
                 (rs, rowNum) -> new Vertex(
                         rs.getLong("id"),
                         rs.getDouble("x"),
@@ -171,21 +171,40 @@ public class FastVisibilityGraphService {
     }
 
     /**
-     * Извлекает forbidden zones (буферы ограничений) из БД
+     * Извлекает forbidden zones (буферы ограничений) из БД.
+     * Буфер строится по restriction_rules: для oks — фактический отступ 5/7/9м,
+     * для остальных — min_horizontal_dist.
      */
-    private List<Geometry> extractForbiddenZones(UUID taskId, int clusterId) {
-        // Извлекаем полигоны forbidden zones
+    private List<Geometry> extractForbiddenZones(UUID taskId, int clusterId, int newDiameter) {
+        double oksBuffer = getOksBufferByDiameter(newDiameter);
+
+        // Извлекаем буферы запретных зон
         return jdbc.query(
-                "SELECT geom_utm FROM restriction_buffer WHERE task_id = ? AND cluster_id = ?",
+                "SELECT ST_AsBinary(ST_Buffer(r.geom_utm, " +
+                "  CASE WHEN rr.type = 'oks' THEN ? ELSE rr.min_horizontal_dist END)) AS geom_wkb " +
+                "FROM input_feature r " +
+                "JOIN restriction_rules rr ON rr.type = r.properties->>'restriction_type' " +
+                "WHERE r.task_id = ? AND r.object_type = 'restriction' " +
+                "  AND COALESCE(rr.crossing_forbidden, FALSE) = TRUE " +
+                "  AND r.geom_utm IS NOT NULL",
                 (rs, rowNum) -> {
                     try {
-                        byte[] wkb = rs.getBytes("geom_utm");
+                        byte[] wkb = rs.getBytes("geom_wkb");
                         return new WKBReader(geometryFactory).read(wkb);
                     } catch (org.locationtech.jts.io.ParseException e) {
                         throw new RuntimeException("Failed to parse WKB geometry", e);
                     }
                 },
-                taskId, clusterId);
+                oksBuffer, taskId);
+    }
+
+    /**
+     * Отступ от ОКС в зависимости от диаметра трубы: 5 / 7 / 9 м
+     */
+    private double getOksBufferByDiameter(int newDiameter) {
+        if (newDiameter < 500) return 5.0;
+        if (newDiameter <= 800) return 7.0;
+        return 9.0;
     }
 
     /**
@@ -280,10 +299,10 @@ public class FastVisibilityGraphService {
      */
     private boolean isVisible(LineString line, STRtree forbiddenTree) {
         Envelope lineEnv = line.getEnvelopeInternal();
-        
+
         // Находим все forbidden zones, которые пересекаются с envelope линии
         List<?> candidates = forbiddenTree.query(lineEnv);
-        
+
         if (candidates.isEmpty()) {
             return true; // Нет препятствий вблизи
         }
@@ -299,6 +318,22 @@ public class FastVisibilityGraphService {
         return true; // Видимость есть
     }
 
+    // ===== Test-only обёртки (используются в FastVisibilityGraphServiceTest) =====
+
+    /**
+     * Публичная обёртка над buildSTRtree для тестов
+     */
+    public STRtree buildSTRtreeForTest(List<Geometry> geometries) {
+        return buildSTRtree(geometries);
+    }
+
+    /**
+     * Публичная обёртка над isVisible для тестов
+     */
+    public boolean isVisibleForTest(LineString line, STRtree forbiddenTree) {
+        return isVisible(line, forbiddenTree);
+    }
+
     /**
      * Вставляет рёбра в таблицу visibility_edge
      */
@@ -306,11 +341,19 @@ public class FastVisibilityGraphService {
         if (edges.isEmpty()) return;
 
         // Пакетная вставка для производительности
-        String sql = "INSERT INTO visibility_edge (task_id, from_vertex, to_vertex, length) VALUES (?, ?, ?, ?)";
-        
+        String sql = "INSERT INTO visibility_edge (" +
+                "task_id, cluster_id, source_vertex, target_vertex, geom, length_m, cost, reverse_cost" +
+                ") VALUES (?, 0, ?, ?, ST_SetSRID(ST_MakeLine(" +
+                "(SELECT geom FROM visibility_vertex WHERE id = ?)," +
+                "(SELECT geom FROM visibility_vertex WHERE id = ?)), 32637), ?, ?, ?)";
+
         List<Object[]> batchArgs = new ArrayList<>(edges.size());
         for (Edge edge : edges) {
-            batchArgs.add(new Object[]{taskId, edge.fromVertex, edge.toVertex, edge.length});
+            batchArgs.add(new Object[]{
+                    taskId, edge.fromVertex, edge.toVertex,
+                    edge.fromVertex, edge.toVertex,
+                    edge.length, edge.length, edge.length
+            });
         }
 
         int batchSize = 1000;
@@ -323,16 +366,16 @@ public class FastVisibilityGraphService {
 
     // ===== Вспомогательные классы =====
 
-    enum VertexType {
+    public enum VertexType {
         OKS, CANDIDATE, CORNER
     }
 
-    static class Vertex {
+    public static class Vertex {
         final long id;
         final double x, y;
         final VertexType type;
 
-        Vertex(long id, double x, double y, VertexType type) {
+        public Vertex(long id, double x, double y, VertexType type) {
             this.id = id;
             this.x = x;
             this.y = y;
@@ -340,31 +383,15 @@ public class FastVisibilityGraphService {
         }
     }
 
-    static class Edge {
-        final long fromVertex;
-        final long toVertex;
-        final double length;
+    public static class Edge {
+        public final long fromVertex;
+        public final long toVertex;
+        public final double length;
 
-        Edge(long fromVertex, long toVertex, double length) {
+        public Edge(long fromVertex, long toVertex, double length) {
             this.fromVertex = fromVertex;
             this.toVertex = toVertex;
             this.length = length;
         }
-    }
-
-    // ===== Методы для тестирования (package-private) =====
-
-    /**
-     * Создаёт STRtree для тестирования
-     */
-    STRtree buildSTRtreeForTest(List<Geometry> geometries) {
-        return buildSTRtree(geometries);
-    }
-
-    /**
-     * Проверяет видимость для тестирования
-     */
-    boolean isVisibleForTest(LineString line, STRtree tree) {
-        return isVisible(line, tree);
     }
 }
