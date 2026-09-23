@@ -9,16 +9,7 @@ import org.locationtech.jts.geom.GeometryFactory;
 import org.locationtech.jts.geom.LineString;
 import org.locationtech.jts.index.strtree.STRtree;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.test.context.ActiveProfiles;
-import org.springframework.test.context.DynamicPropertyRegistry;
-import org.springframework.test.context.DynamicPropertySource;
-import org.testcontainers.DockerClientFactory;
-import org.testcontainers.containers.PostgreSQLContainer;
-import org.testcontainers.junit.jupiter.Container;
-import org.testcontainers.junit.jupiter.Testcontainers;
-import org.testcontainers.utility.DockerImageName;
 
 import java.util.*;
 
@@ -26,57 +17,12 @@ import static org.junit.jupiter.api.Assertions.*;
 
 /**
  * Тесты для FastVisibilityGraphService с JTS STRtree.
- * 
- * Используют Testcontainers для поднятия изолированного PostgreSQL с PostGIS и pgRouting.
- * Каждый тест запускается в чистой базе данных.
+ *
+ * Инфраструктура Testcontainers (проверка Docker, контейнер PostgreSQL+PostGIS+pgRouting,
+ * проброс JDBC-свойств в Spring) унаследована из {@link BasePostgresIntegrationTest}.
  */
-@Testcontainers
-@SpringBootTest
 @DisplayName("FastVisibilityGraphService тесты")
-class FastVisibilityGraphServiceTest {
-
-    static {
-        // Fail-fast: полное сообщение об причине вместо безликого "ExceptionInInitializerError".
-        // Surefire по умолчанию обрезает стектрейсы — здесь печатаем причину целиком в stdout.
-        try {
-            if (!DockerClientFactory.instance().isDockerAvailable()) {
-                throw new IllegalStateException(
-                    "Docker недоступен. Проверьте, что Docker Desktop запущен и доступен " +
-                    "tcp://localhost:2375 (Settings -> General -> Expose daemon on tcp://localhost:2375 without TLS), " +
-                    "либо задайте DOCKER_HOST. См. src/test/resources/testcontainers.properties.");
-            }
-        } catch (Throwable t) {
-            System.err.println("=== Testcontainers/Docker init FAILED ===");
-            Throwable cause = t;
-            while (cause != null) {
-                System.err.println(cause.getClass().getName() + ": " + cause.getMessage());
-                for (StackTraceElement el : Arrays.copyOf(cause.getStackTrace(), Math.min(15, cause.getStackTrace().length))) {
-                    System.err.println("    at " + el);
-                }
-                cause = cause.getCause();
-            }
-            System.err.println("=====================================");
-            throw new IllegalStateException("Не удалось подключиться к Docker: " + t, t);
-        }
-    }
-
-    // Образ PostgreSQL с PostGIS и pgRouting
-    @Container
-    static final PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(
-            DockerImageName.parse("nickblah/pgrouting:16-postgis-3.6-pgrouting-4.0.1")
-    ).withDatabaseName("testdb")
-      .withUsername("test")
-      .withPassword("test");
-
-    @DynamicPropertySource
-    static void overrideProps(DynamicPropertyRegistry registry) {
-        registry.add("spring.datasource.url", postgres::getJdbcUrl);
-        registry.add("spring.datasource.username", postgres::getUsername);
-        registry.add("spring.datasource.password", postgres::getPassword);
-        registry.add("spring.datasource.driver-class-name", () -> "org.postgresql.Driver");
-        registry.add("spring.flyway.enabled", () -> "true");
-        registry.add("spring.flyway.locations", () -> "classpath:db/migration");
-    }
+class FastVisibilityGraphServiceTest extends BasePostgresIntegrationTest {
 
     @Autowired
     private JdbcTemplate jdbcTemplate;

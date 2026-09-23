@@ -3,9 +3,7 @@ package ru.dit.heattracer.service;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.test.context.ActiveProfiles;
 
 import java.util.List;
 import java.util.Map;
@@ -21,10 +19,8 @@ import static org.junit.jupiter.api.Assertions.*;
  * 3. Connectivity (все OKS достигают кандидатов)
  * 4. Длина маршрутов (не должна вырасти >10%)
  */
-@SpringBootTest
-@ActiveProfiles("test")
 @DisplayName("Валидация графа видимости")
-class VisibilityGraphValidationTest {
+class VisibilityGraphValidationTest extends BasePostgresIntegrationTest {
 
     @Autowired
     private JdbcTemplate jdbcTemplate;
