@@ -111,26 +111,22 @@ class FastVisibilityGraphServiceTest extends BasePostgresIntegrationTest {
             new FastVisibilityGraphService.Vertex(2L, 50.0, 0.0, FastVisibilityGraphService.VertexType.CORNER), // 50м
             new FastVisibilityGraphService.Vertex(3L, 150.0, 0.0, FastVisibilityGraphService.VertexType.CORNER) // 150м (> R_MAX)
         );
-        List<FastVisibilityGraphService.Edge> edges = new ArrayList<>();
-        STRtree emptyTree = new STRtree();
+        // Вызываем ПРОDUCTION-код генерации рёбер напрямую (без рефлексии).
+        // Все вершины типа CORNER -> применяется rMaxCorner (по умолчанию 120м):
+        // пара 1-2 (50м) проходит, пара 2-3 (100м) проходит, пара 1-3 (150м) — нет.
+        List<FastVisibilityGraphService.Edge> edges =
+            fastService.generateEdgesForTest(corners, new STRtree());
 
-        // Используем рефлексию для вызова приватного метода
-        try {
-            java.lang.reflect.Method method = FastVisibilityGraphService.class.getDeclaredMethod(
-                "addEdgesForPair", List.class, List.class, List.class, STRtree.class, double.class
-            );
-            method.setAccessible(true);
-            // Используем rMaxCorner = 100м из настроек сервиса
-            method.invoke(fastService, corners, corners, edges, emptyTree, 100.0);
-        } catch (Exception e) {
-            fail("Не удалось вызвать метод: " + e.getMessage());
+        // Рёбра неориентированные (reverse_cost), каждая пара хранится один раз
+        assertEquals(2, edges.size(), "Должно быть 2 ребра: 1-2 (50м) и 2-3 (100м), оба < rMaxCorner");
+        Set<String> pairs = new HashSet<>();
+        for (FastVisibilityGraphService.Edge e : edges) {
+            String key = Math.min(e.fromVertex, e.toVertex) + "-" + Math.max(e.fromVertex, e.toVertex);
+            assertTrue(pairs.add(key), "Симметричный дубль ребра: " + e.fromVertex + "->" + e.toVertex);
         }
-
-        // Должно быть 1 ребро (между вершинами 1 и 2, расстояние 50м)
-        // Ребро между 1 и 3 (150м) не должно быть создано
-        assertEquals(1, edges.size(), "Должно быть 1 ребро (50м < 100м R_MAX)");
-        assertEquals(1L, edges.get(0).fromVertex);
-        assertEquals(2L, edges.get(0).toVertex);
+        assertTrue(pairs.contains("1-2"), "Должно быть ребро 1-2 (50м)");
+        assertTrue(pairs.contains("2-3"), "Должно быть ребро 2-3 (100м)");
+        assertFalse(pairs.contains("1-3"), "Ребра 1-3 (150м > rMaxCorner) быть не должно");
     }
 
     @Test
@@ -145,22 +141,21 @@ class FastVisibilityGraphServiceTest extends BasePostgresIntegrationTest {
             new FastVisibilityGraphService.Vertex(3L, 1500.0, 0.0, FastVisibilityGraphService.VertexType.CANDIDATE) // 1500м (> R_MAX)
         );
 
-        List<FastVisibilityGraphService.Edge> edges = new ArrayList<>();
-        STRtree emptyTree = new STRtree();
+        // Вызываем ПРОDUCTION-код напрямую: OKS-CANDIDATE соединяются с rMaxCandidate (2500м),
+        // поэтому обе пары (500м и 1500м) допустимы; дублированных обратных рёбер быть не должно.
+        List<FastVisibilityGraphService.Vertex> allVertices = new ArrayList<>();
+        allVertices.addAll(oksList);
+        allVertices.addAll(candidateList);
+        List<FastVisibilityGraphService.Edge> edges =
+            fastService.generateEdgesForTest(allVertices, new STRtree());
 
-        try {
-            java.lang.reflect.Method method = FastVisibilityGraphService.class.getDeclaredMethod(
-                "addEdgesForPair", List.class, List.class, List.class, STRtree.class, double.class
-            );
-            method.setAccessible(true);
-            // Используем rMaxCandidate = 1000м из настроек сервиса
-            method.invoke(fastService, oksList, candidateList, edges, emptyTree, 1000.0);
-        } catch (Exception e) {
-            fail("Не удалось вызвать метод: " + e.getMessage());
+        assertEquals(2, edges.size(), "Должно быть 2 ребра: OKS-candidate(500м) и OKS-candidate(1500м)");
+        // Проверка отсутствия симметричных дублей: множества пар {a,b} уникальны
+        Set<String> pairs = new HashSet<>();
+        for (FastVisibilityGraphService.Edge e : edges) {
+            String key = Math.min(e.fromVertex, e.toVertex) + "-" + Math.max(e.fromVertex, e.toVertex);
+            assertTrue(pairs.add(key), "Симметричный дубль ребра: " + e.fromVertex + "->" + e.toVertex);
         }
-
-        // Должно быть 1 ребро (между OKS и кандидатом на расстоянии 500м)
-        assertEquals(1, edges.size(), "Должно быть 1 ребро (500м < 1000м R_MAX)");
     }
 
     @Test
@@ -189,15 +184,8 @@ class FastVisibilityGraphServiceTest extends BasePostgresIntegrationTest {
             new FastVisibilityGraphService.Edge(3L, 4L, 300.0)
         );
 
-        try {
-            java.lang.reflect.Method method = FastVisibilityGraphService.class.getDeclaredMethod(
-                "insertEdges", UUID.class, List.class
-            );
-            method.setAccessible(true);
-            method.invoke(fastService, taskId, edges);
-        } catch (Exception e) {
-            fail("Не удалось вызвать метод: " + e.getMessage());
-        }
+        // insertEdges — package-private, вызывается напрямую из теста того же пакета
+        fastService.insertEdges(taskId, edges);
 
         // Проверяем, что рёбра вставлены
         int count = jdbcTemplate.queryForObject(

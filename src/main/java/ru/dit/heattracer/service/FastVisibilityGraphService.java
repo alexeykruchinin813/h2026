@@ -252,9 +252,23 @@ public class FastVisibilityGraphService {
     }
 
     /**
-     * Добавляет рёбра для пар вершин одного или разных типов
+     * Публичная точка входа для генерации рёбер (используется тестами вместо рефлексии).
+     * Вызывает production-метод {@link #generateEdgesWithVisibility}.
+     *
+     * @param vertices      список вершин графа
+     * @param forbiddenTree STRtree запретных зон
+     * @return список построенных рёбер
      */
-    private void addEdgesForPair(List<Vertex> list1, List<Vertex> list2, List<Edge> edges, 
+    public List<Edge> generateEdgesForTest(List<Vertex> vertices, STRtree forbiddenTree) {
+        return generateEdgesWithVisibility(vertices, forbiddenTree);
+    }
+
+    /**
+     * Добавляет рёбра для пар вершин одного или разных типов.
+     * Package-private: вызывается напрямую из тестов того же пакета
+     * (рефлексия для тестирования не требуется).
+     */
+    void addEdgesForPair(List<Vertex> list1, List<Vertex> list2, List<Edge> edges, 
                                   STRtree forbiddenTree, double rMax) {
         if (rMax <= 0) return; // Не соединяем пары этого типа
 
@@ -335,9 +349,10 @@ public class FastVisibilityGraphService {
     }
 
     /**
-     * Вставляет рёбра в таблицу visibility_edge
+     * Вставляет рёбра в таблицу visibility_edge.
+     * Package-private: вызывается напрямую из тестов того же пакета.
      */
-    private void insertEdges(UUID taskId, List<Edge> edges) {
+    void insertEdges(UUID taskId, List<Edge> edges) {
         if (edges.isEmpty()) return;
 
         // Пакетная вставка для производительности
