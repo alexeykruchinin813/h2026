@@ -134,11 +134,6 @@ class FastVisibilityGraphServiceTest {
     @Test
     @DisplayName("R_MAX для corner-corner пар соблюдается")
     void testRMaxCornerCorner() {
-        // Устанавливаем rMaxCorner = 100м
-        FastVisibilityGraphService service = new FastVisibilityGraphService(
-            jdbcTemplate, 100.0, 2500.0, 500.0, 400, 2.0
-        );
-
         List<FastVisibilityGraphService.Vertex> corners = Arrays.asList(
             new FastVisibilityGraphService.Vertex(1L, 0.0, 0.0, FastVisibilityGraphService.VertexType.CORNER),
             new FastVisibilityGraphService.Vertex(2L, 50.0, 0.0, FastVisibilityGraphService.VertexType.CORNER), // 50м
@@ -154,7 +149,8 @@ class FastVisibilityGraphServiceTest {
                 "addEdgesForPair", List.class, List.class, List.class, STRtree.class, double.class
             );
             method.setAccessible(true);
-            method.invoke(service, corners, corners, edges, emptyTree, 100.0);
+            // Используем rMaxCorner = 100м из настроек сервиса
+            method.invoke(fastService, corners, corners, edges, emptyTree, 100.0);
         } catch (Exception e) {
             fail("Не удалось вызвать метод: " + e.getMessage());
         }
@@ -169,11 +165,6 @@ class FastVisibilityGraphServiceTest {
     @Test
     @DisplayName("R_MAX для oks-candidate пар соблюдается")
     void testRMaxOksCandidate() {
-        // Устанавливаем rMaxCandidate = 1000м
-        FastVisibilityGraphService service = new FastVisibilityGraphService(
-            jdbcTemplate, 120.0, 1000.0, 500.0, 400, 2.0
-        );
-
         List<FastVisibilityGraphService.Vertex> oksList = Arrays.asList(
             new FastVisibilityGraphService.Vertex(1L, 0.0, 0.0, FastVisibilityGraphService.VertexType.OKS)
         );
@@ -191,7 +182,8 @@ class FastVisibilityGraphServiceTest {
                 "addEdgesForPair", List.class, List.class, List.class, STRtree.class, double.class
             );
             method.setAccessible(true);
-            method.invoke(service, oksList, candidateList, edges, emptyTree, 1000.0);
+            // Используем rMaxCandidate = 1000м из настроек сервиса
+            method.invoke(fastService, oksList, candidateList, edges, emptyTree, 1000.0);
         } catch (Exception e) {
             fail("Не удалось вызвать метод: " + e.getMessage());
         }
@@ -205,15 +197,6 @@ class FastVisibilityGraphServiceTest {
     void testBatchInsert() {
         UUID taskId = UUID.randomUUID();
         
-        // Создаём сервис для теста
-        FastVisibilityGraphService service = new FastVisibilityGraphService(jdbcTemplate);
-        
-        List<FastVisibilityGraphService.Edge> edges = Arrays.asList(
-            new FastVisibilityGraphService.Edge(1L, 2L, 100.0),
-            new FastVisibilityGraphService.Edge(2L, 3L, 200.0),
-            new FastVisibilityGraphService.Edge(3L, 4L, 300.0)
-        );
-
         // Создаём тестовую запись задачи
         jdbcTemplate.update(
             "INSERT INTO task (id, status, stage, percent) VALUES (?, 'RUNNING', 'TEST', 0)",
@@ -236,6 +219,12 @@ class FastVisibilityGraphServiceTest {
         jdbcTemplate.update(
             "INSERT INTO visibility_vertex (task_id, id, vertex_type, geom_utm) VALUES (?, ?, 'corner', ST_MakePoint(300, 0))",
             taskId, 4L
+        );
+
+        List<FastVisibilityGraphService.Edge> edges = Arrays.asList(
+            new FastVisibilityGraphService.Edge(1L, 2L, 100.0),
+            new FastVisibilityGraphService.Edge(2L, 3L, 200.0),
+            new FastVisibilityGraphService.Edge(3L, 4L, 300.0)
         );
 
         try {
