@@ -31,7 +31,6 @@ import static org.junit.jupiter.api.Assertions.*;
  */
 @Testcontainers
 @SpringBootTest
-@ActiveProfiles("test")
 @DisplayName("FastVisibilityGraphService тесты")
 class FastVisibilityGraphServiceTest {
 
@@ -56,14 +55,14 @@ class FastVisibilityGraphServiceTest {
     @Autowired
     private JdbcTemplate jdbcTemplate;
 
+    @Autowired
     private FastVisibilityGraphService fastService;
+    
     private GeometryFactory geometryFactory;
 
     @BeforeEach
     void setUp() {
         geometryFactory = new GeometryFactory();
-        // Создаём сервис с параметрами по умолчанию
-        fastService = new FastVisibilityGraphService(jdbcTemplate);
     }
 
     @Test
