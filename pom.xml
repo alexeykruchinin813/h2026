@@ -29,11 +29,46 @@
         <proj4j.version>1.2.2</proj4j.version>
         <jgrapht.version>1.5.3</jgrapht.version>
         <springdoc.version>1.7.0</springdoc.version>
+
+        <!-- Testcontainers 1.20.x = docker-java 3.4.x: последний ряд, работающий с Java 11
+             (Testcontainers 1.21+/docker-java 3.5+ требуют Java 17). -->
+        <testcontainers.version>1.20.6</testcontainers.version>
+        <!-- Ключевой фикс конфликта версий: spring-boot-starter-parent 2.6.3 управляет Jackson 2.13.1,
+             который слишком стар для docker-java 3.4.x и некорректно выполняет API-negotiation
+             с Docker Engine 27+ (400 Bad Request на /v1.32/info -> ExceptionInInitializerError).
+             Поднимаем Jackson до актуальной ветки 2.18.x через BOM. -->
+        <jackson-bom.version>2.18.4</jackson-bom.version>
     </properties>
+
+    <!-- ============ dependencyManagement ============
+         1) Testcontainers BOM — единая согласованная версия всех артефактов testcontainers
+            и транзитивного docker-java. Раньше версии фиксировались вручную по отдельности,
+            из-за чего возникали конфликты (транспорт, несовместимый с Docker Engine 27+).
+         2) Jackson BOM — переопределяет управляемую spring-boot-starter-parent версию 2.13.1:
+            docker-java 3.5.x требует Jackson >= 2.14, иначе negotiation API-версии с Docker
+            Desktop 4.35+/Engine 29 падает с "400 Bad Request" -> ExceptionInInitializerError.
+            dependencyManagement проекта имеет приоритет над managed-зависимостями parent. -->
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>org.testcontainers</groupId>
+                <artifactId>testcontainers-bom</artifactId>
+                <version>${testcontainers.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <dependency>
+                <groupId>com.fasterxml.jackson</groupId>
+                <artifactId>jackson-bom</artifactId>
+                <version>${jackson-bom.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
 
     <dependencies>
         <!-- ============ Spring Boot ============ -->
-
         <!-- REST API (Spring MVC, Jackson, Tomcat) -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
@@ -48,11 +83,11 @@
 
         <!-- ============ Документация API ============ -->
 
-        <!-- Swagger UI для Spring Boot 2.6.x -->
+        <!-- Swagger UI для Spring Boot 2.6.x (версия управляется свойством springdoc.version) -->
         <dependency>
             <groupId>org.springdoc</groupId>
             <artifactId>springdoc-openapi-ui</artifactId>
-            <version>1.7.0</version>
+            <version>${springdoc.version}</version>
         </dependency>
 
         <!-- ============ Геометрия ============ -->
@@ -102,31 +137,15 @@
             <scope>test</scope>
         </dependency>
 
-        <!-- Testcontainers для интеграционных тестов с PostgreSQL -->
+        <!-- Testcontainers для интеграционных тестов с PostgreSQL (версии — из BOM в dependencyManagement) -->
         <dependency>
             <groupId>org.testcontainers</groupId>
             <artifactId>postgresql</artifactId>
-            <version>1.20.4</version>
-            <scope>test</scope>
-        </dependency>
-        <!-- Явная фиксация docker-java: 1.19.x тянет транспорт, несовместимый с Docker Engine 25-28
-             (ошибка "Could not initialize class org.testcontainers.DockerClientFactory" / ExceptionInInitializerError) -->
-        <dependency>
-            <groupId>com.github.docker-java</groupId>
-            <artifactId>docker-java-api</artifactId>
-            <version>3.4.0</version>
-            <scope>test</scope>
-        </dependency>
-        <dependency>
-            <groupId>com.github.docker-java</groupId>
-            <artifactId>docker-java-transport-zerodep</artifactId>
-            <version>3.4.0</version>
             <scope>test</scope>
         </dependency>
         <dependency>
             <groupId>org.testcontainers</groupId>
             <artifactId>junit-jupiter</artifactId>
-            <version>1.20.4</version>
             <scope>test</scope>
         </dependency>
 
@@ -163,6 +182,48 @@
             <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+
+            <!-- Maven Enforcer: ловит конфликты версий ДО падения тестов.
+                 Maven сам по себе молча выбирает "победителя" по nearest-wins —
+                 именно так Jackson 2.13 из Spring Boot тихо перебивал нужную
+                 docker-java версию. Эти правила делают такие ситуации сборочной ошибкой. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-enforcer-plugin</artifactId>
+                <version>3.4.1</version>
+                <executions>
+                    <execution>
+                        <id>enforce-dependency-rules</id>
+                        <goals>
+                            <goal>enforce</goal>
+                        </goals>
+                        <configuration>
+                            <rules>
+                                <requireJavaVersion>
+                                    <version>[11,)</version>
+                                </requireJavaVersion>
+                                <requireMavenVersion>
+                                    <version>[3.6.0,)</version>
+                                </requireMavenVersion>
+                                <!-- запрещённые (заведомо несовместимые) версии -->
+                                <bannedDependencies>
+                                    <excludes>
+                                        <!-- docker-java < 3.4 не работает с Docker Engine 27+ (400 Bad Request) -->
+                                        <exclude>com.github.docker-java:*:[0,3.4)</exclude>
+                                        <!-- testcontainers < 1.20 тянет старый docker-java -->
+                                        <exclude>org.testcontainers:*:[0,1.20)</exclude>
+                                        <!-- Jackson < 2.14 несовместим с docker-java 3.4.x (битый API-negotiation) -->
+                                        <exclude>com.fasterxml.jackson.core:jackson-databind:[0,2.14)</exclude>
+                                    </excludes>
+                                </bannedDependencies>
+                                <!-- единая версия артефакта во всём дереве (ловит nearest-wins конфликты) -->
+                                <banDuplicatePomDependencyVersions/>
+                                <dependencyConvergence/>
+                            </rules>
+                        </configuration>
+                    </execution>
+                </executions>
             </plugin>
         </plugins>
     </build>
