@@ -218,6 +218,12 @@
                 <configuration>
                     <!-- Не обрезать стектрейсы: иначе причина ExceptionInInitializerError не видна -->
                     <trimStackTrace>false</trimStackTrace>
+                    <!-- Дублируем версию Docker API через ENV: docker-java читает
+                         DOCKER_API_VERSION из окружения (classpath docker-java.properties — запасной путь).
+                         Java-код задать это НЕ может (JVM уже запущена), поэтому фиксируем в pom. -->
+                    <environmentVariables>
+                        <DOCKER_API_VERSION>1.44</DOCKER_API_VERSION>
+                    </environmentVariables>
                 </configuration>
             </plugin>
             <!-- Плагин Spring Boot: позволяет запускать приложение как java -jar -->
