@@ -31,7 +31,23 @@ abstract class BasePostgresIntegrationTest {
     private static final String POSTGRES_IMAGE = "nickblah/pgrouting:16-postgis-3.6-pgrouting-4.0.1";
 
     static {
+        forceModernDockerApiVersion();
         checkDockerAvailability();
+    }
+
+    /**
+     * Принудительно задаёт современную версию Docker API через системное свойство dockerjava.
+     *
+     * <p>Docker Desktop 29.x при exposed TCP-порту может работать через compatibility-прокси,
+     * который отвергает legacy-запросы версии v1.32 (по умолчанию в docker-java) со статусом 400.
+     * Свойство {@code docker-java.api.version} заставляет клиента использовать актуальную версию API.
+     * Не перезаписывает значение, если пользователь уже задал его явно.
+     */
+    private static void forceModernDockerApiVersion() {
+        if (System.getProperty("docker-java.api.version") == null
+                && System.getenv("DOCKER_JAVA_API_VERSION") == null) {
+            System.setProperty("docker-java.api.version", "v1.44");
+        }
     }
 
     @Container
