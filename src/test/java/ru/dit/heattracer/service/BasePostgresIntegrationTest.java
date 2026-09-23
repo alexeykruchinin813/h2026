@@ -7,6 +7,7 @@ import org.testcontainers.DockerClientFactory;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
+import org.testcontainers.utility.DockerImageName;
 
 /**
  * Базовый класс для интеграционных тестов с изолированным PostgreSQL (PostGIS + pgRouting).
@@ -38,7 +39,11 @@ abstract class BasePostgresIntegrationTest {
     }
 
     @Container
-    static final PostgreSQLContainer<?> POSTGRES = new PostgreSQLContainer<>(POSTGRES_IMAGE)
+    static final PostgreSQLContainer<?> POSTGRES = new PostgreSQLContainer<>(
+                    // Кастомный образ (не postgres:*) — явно заявляем Testcontainers,
+                    // что это совместимая замена postgres, иначе падает проверка
+                    // "Failed to verify that image ... is a compatible substitute for 'postgres'".
+                    DockerImageName.parse(POSTGRES_IMAGE).asCompatibleSubstituteFor("postgres"))
             .withDatabaseName("testdb")
             .withUsername("test")
             .withPassword("test")
