@@ -151,13 +151,43 @@ class VisibilityGraphValidationTest extends BasePostgresIntegrationTest {
     @Test
     @DisplayName("Параметры функции build_visibility_graph по умолчанию")
     void testBuildVisibilityGraphDefaults() {
-        // Проверяем значения параметров по умолчанию
+        // ВАЖНО: в БД исторически накапливались ОСИРОТЕВШИЕ сигнатуры build_visibility_graph
+        // (V19: 5 аргументов, V23: 7 аргументов — их не удаляли ни V24, ни V25).
+        // information_schema.parameters фильтруется только по specific_name, поэтому без
+        // фильтра по сигнатуре строки параметров разных версий смешиваются,
+        // и Map-'ассоциации' перезаписываются NULL/устаревшими дефолтами (регрессия: expected 400 but was null).
+        // Миграция V29 удаляет все старые сигнатуры; тест проверяет, что в каталоге
+        // осталась ровно ОДНА каноническая версия, и читает дефолты из pg_proc по её OID.
+        List<Map<String, Object>> overloads = jdbcTemplate.queryForList(
+            "SELECT p.oid, " +
+            "       pg_get_function_arguments(p.oid) AS args " +
+            "FROM pg_proc p " +
+            "JOIN pg_namespace ns ON ns.oid = p.pronamespace " +
+            "WHERE p.proname = 'build_visibility_graph' " +
+            "  AND ns.nspname NOT IN ('pg_catalog','information_schema')"
+        );
+
+        assertFalse(overloads.isEmpty(),
+            "build_visibility_graph отсутствует в каталоге — миграции не применились?");
+
+        if (overloads.size() > 1) {
+            StringBuilder sb = new StringBuilder();
+            for (Map<String, Object> o : overloads) {
+                sb.append("\n  - ").append(o.get("args"));
+            }
+            fail("В БД найдено " + overloads.size() + " перегрузок build_visibility_graph " +
+                "(осиротевшие сигнатуры, регрессия V19/V23 — см. V29):" + sb);
+        }
+
+        Long fnOid = ((Number) overloads.get(0).get("oid")).longValue();
+
         List<Map<String, Object>> params = jdbcTemplate.queryForList(
-            "SELECT parameter_name, parameter_default " +
-            "FROM information_schema.parameters " +
-            "WHERE specific_name = 'build_visibility_graph' " +
-            "AND parameter_name IN ('p_max_corners', 'p_r_max_corner', 'p_simplify_tolerance') " +
-            "ORDER BY parameter_name"
+            "SELECT a.argname AS parameter_name, " +
+            "       pg_get_function_arg_default(p.oid, a.ordinality) AS parameter_default " +
+            "FROM pg_proc p, unnest(p.proargnames) WITH ORDINALITY AS a(argname, ordinality) " +
+            "WHERE p.oid = ?::oid " +
+            "  AND a.argname IN ('p_max_corners', 'p_r_max_corner', 'p_simplify_tolerance')",
+            fnOid
         );
 
         Map<String, String> defaults = new java.util.HashMap<>();
