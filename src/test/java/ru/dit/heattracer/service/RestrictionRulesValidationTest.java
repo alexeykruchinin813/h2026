@@ -31,9 +31,11 @@ class RestrictionRulesValidationTest extends BasePostgresIntegrationTest {
     void testAllRestrictionTypesPresent() {
         // По ТЗ должны быть: okc, road, tram_tracks, gas, power, heat_network, railway, waterway, green_zone
         
+        // Канонические имена типов из Таблицы 2 (см. V7/V13 и InputValidator):
+        // в БД используются gas_pipeline / power_cable / water, а НЕ gas / power / waterway.
         List<String> expectedTypes = List.of(
-            "oks", "road", "tram_tracks", "gas", "power", 
-            "heat_network", "railway", "waterway", "green_zone"
+            "oks", "road", "tram_tracks", "gas_pipeline", "power_cable",
+            "heat_network", "railway", "water", "park", "social_area", "prohibited_site"
         );
 
         List<String> actualTypes = jdbcTemplate.queryForList(
@@ -83,7 +85,8 @@ class RestrictionRulesValidationTest extends BasePostgresIntegrationTest {
     @Test
     @DisplayName("special_pass_allowed типы имеют special_k коэффициент")
     void testSpecialPassCoefficients() {
-        List<String> specialTypes = List.of("road", "tram_tracks", "gas", "power", "heat_network");
+        // gas_pipeline / power_cable — канонические имена типов (ВМЕСТО gas / power)
+        List<String> specialTypes = List.of("road", "tram_tracks", "gas_pipeline", "power_cable", "heat_network");
 
         for (String type : specialTypes) {
             Map<String, Object> rule = jdbcTemplate.queryForMap(
@@ -110,11 +113,18 @@ class RestrictionRulesValidationTest extends BasePostgresIntegrationTest {
 
         assertTrue((Boolean) rule.get("crossing_forbidden"),
             "oks: crossing_forbidden должен быть TRUE");
-        
-        // Буфер задаётся в параметрах функции (p_oks_buffer_rough)
-        // Здесь проверяем только наличие правила
-        assertNotNull(rule.get("min_horizontal_dist"),
-            "oks: min_horizontal_dist должен быть задан");
+
+        // V13: for oks min_horizontal_dist is intentionally NULL —
+        // the allowed distance depends on the new pipe diameter (dynamic).
+        assertNull(rule.get("min_horizontal_dist"),
+            "oks: min_horizontal_dist должен быть NULL (динамический отступ по ДУ)");
+
+        assertEquals(5.0, ((Number) rule.get("min_dist_lt_500")).doubleValue(), 0.01,
+            "oks: min_dist_lt_500 = 5.0м");
+        assertEquals(7.0, ((Number) rule.get("min_dist_500_800")).doubleValue(), 0.01,
+            "oks: min_dist_500_800 = 7.0м");
+        assertEquals(9.0, ((Number) rule.get("min_dist_ge_900")).doubleValue(), 0.01,
+            "oks: min_dist_ge_900 = 9.0м");
     }
 
     @Test
@@ -132,23 +142,40 @@ class RestrictionRulesValidationTest extends BasePostgresIntegrationTest {
     @Test
     @DisplayName("build_visibility_graph имеет параметры оптимизации")
     void testBuildVisibilityGraphParameters() {
+        // В PostgreSQL information_schema.parameters.specific_name = "<имя>_<OID>",
+        // поэтому фильтруем через JOIN с routines по routine_name.
         List<Map<String, Object>> params = jdbcTemplate.queryForList(
-            "SELECT parameter_name, data_type, parameter_default " +
-            "FROM information_schema.parameters " +
-            "WHERE specific_name = 'build_visibility_graph' " +
-            "ORDER BY ordinal_position"
+            "SELECT p.parameter_name, p.data_type, p.parameter_default " +
+            "FROM information_schema.parameters p " +
+            "JOIN information_schema.routines r " +
+            "  ON p.specific_name = r.specific_name " +
+            " AND p.specific_schema = r.specific_schema " +
+            "WHERE r.routine_schema = 'public' " +
+            "  AND r.routine_name = 'build_visibility_graph' " +
+            "ORDER BY p.ordinal_position"
         );
 
-        boolean hasSimplifyTolerance = params.stream()
-            .anyMatch(p -> "p_simplify_tolerance".equals(p.get("parameter_name")));
+        assertFalse(params.isEmpty(),
+            "Параметры build_visibility_graph не найдены");
 
-        assertTrue(hasSimplifyTolerance,
+        java.util.Set<String> names = new java.util.HashSet<>();
+        for (Map<String, Object> p : params) {
+            names.add((String) p.get("parameter_name"));
+        }
+
+        assertTrue(names.contains("p_simplify_tolerance"),
             "build_visibility_graph должен иметь параметр p_simplify_tolerance");
-
-        boolean hasMaxCorners = params.stream()
-            .anyMatch(p -> "p_max_corners".equals(p.get("parameter_name")));
-
-        assertTrue(hasMaxCorners,
+        assertTrue(names.contains("p_max_corners"),
             "build_visibility_graph должен иметь параметр p_max_corners");
+        assertTrue(names.contains("p_oks_buffer_rough"),
+            "build_visibility_graph должен иметь параметр p_oks_buffer_rough");
+
+        // Каноническая перегрузка должна быть единственной (V29):
+        // иначе возможно неоднозначное разрешение при вызове.
+        Long overloads = jdbcTemplate.queryForObject(
+            "SELECT count(*) FROM pg_proc WHERE proname = 'build_visibility_graph'",
+            Long.class);
+        assertEquals(1L, overloads,
+            "Должна быть ровно одна перегрузка build_visibility_graph");
     }
 }
