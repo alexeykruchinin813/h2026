@@ -143,7 +143,7 @@ public class HybridVisibilityGraphService {
      * Добавляет escape points через SQL функцию
      */
     private int addEscapePoints(UUID taskId, int clusterId) {
-        String sql = "SELECT count(*) FROM create_escape_points(?, ?, ?)";
+        String sql = "SELECT count(*) FROM create_escape_points(?::uuid, ?::int, ?::double precision)";
         
         return jdbc.queryForObject(sql, Integer.class, taskId, clusterId, escapeBufferDist);
     }
