@@ -7,6 +7,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 import ru.dit.heattracer.model.PathResult;
 
+import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -35,7 +36,9 @@ public class PathFinderService {
                             "       ST_AsText(path_geom) AS path_wkt, edge_ids " +
                             "  FROM find_visibility_path_geom(?, ?, ?, ?)",
                     (rs, i) -> {
-                        Double cost = rs.getObject("total_cost", Double.class);
+                        // total_cost / total_length — PostGIS NUMERIC, читаем через BigDecimal:
+                        // JDBC-драйвер не поддерживает getObject(col, Double.class) для numeric.
+                        BigDecimal cost = rs.getBigDecimal("total_cost");
                         if (cost == null || rs.getInt("edge_count") == 0) {
                             return PathResult.notFound(fromVertex, toVertex);
                         }
@@ -55,8 +58,8 @@ public class PathFinderService {
 
                         return new PathResult(
                                 fromVertex, toVertex,
-                                cost,
-                                rs.getDouble("total_length"),
+                                cost.doubleValue(),
+                                toDouble(rs.getBigDecimal("total_length")),
                                 rs.getInt("edge_count"),
                                 wkt, ids, true);
                     },
@@ -104,8 +107,8 @@ public class PathFinderService {
 
                     results.add(new PathResult(
                             oksVertex, target,
-                            rs.getDouble("total_cost"),
-                            rs.getDouble("total_length"),
+                            toDouble(rs.getBigDecimal("total_cost")),
+                            toDouble(rs.getBigDecimal("total_length")),
                             rs.getInt("edge_count"),
                             wkt, ids, true));
                 },
@@ -149,8 +152,8 @@ public class PathFinderService {
 
                         return new PathResult(
                                 oksVertex, target,
-                                rs.getDouble("total_cost"),
-                                rs.getDouble("total_length"),
+                                toDouble(rs.getBigDecimal("total_cost")),
+                                toDouble(rs.getBigDecimal("total_length")),
                                 rs.getInt("edge_count"),
                                 wkt, ids, true);
                     },
@@ -160,5 +163,14 @@ public class PathFinderService {
                     taskId, oksVertex, e.getMessage());
             return null;
         }
+    }
+
+    /**
+     * Безопасная конвертация NUMERIC-колонки (BigDecimal) в double.
+     * pgjdbc не поддерживает чтение numeric напрямую в double через {@code getDouble}
+     * на некоторых путях драйвера, поэтому конверсия выполняется явно.
+     */
+    private static double toDouble(BigDecimal value) {
+        return value == null ? 0.0 : value.doubleValue();
     }
 }
