@@ -25,7 +25,7 @@ class HybridConnectivityIT extends BasePostgresIntegrationTest {
 
     private static final int P0_TARGET_CONNECTED = 10;
     private static final String TEST_DATASET_RESOURCE = "first_dataset.geojson";
-    private static final long TIMEOUT_MS = 180_000; // 3 минуты на полный пайплайн
+    private static final long TIMEOUT_MS = 300_000; // 5 минут: escape-этап ~75с/кластер до оптимизации V33
     private static final long POLL_INTERVAL_MS = 1_000;
 
     @Autowired
