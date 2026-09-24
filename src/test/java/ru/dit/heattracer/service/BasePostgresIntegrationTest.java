@@ -5,7 +5,6 @@ import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.testcontainers.DockerClientFactory;
 import org.testcontainers.containers.PostgreSQLContainer;
-import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.DockerImageName;
 
@@ -16,7 +15,9 @@ import org.testcontainers.utility.DockerImageName;
  * <ul>
  *   <li>fail-fast проверку доступности Docker с полным сообщением о причине
  *       (вместо безликого {@code ExceptionInInitializerError});</li>
- *   <li>общий контейнер {@code nickblah/pgrouting} (один на JVM, переиспользуется всеми тестами);</li>
+ *   <li>общий контейнер {@code nickblah/pgrouting}: ленивый singleton на всю JVM
+ *       (без {@code @Container}, иначе Testcontainers переставлял бы его между классами,
+ *       а кешированный Spring-контекст терял бы соединения HikariCP);</li>
  *   <li>проброс JDBC-параметров в Spring через {@link DynamicPropertySource}.</li>
  * </ul>
  *
@@ -25,7 +26,7 @@ import org.testcontainers.utility.DockerImageName;
  * подменяются на реальные значения контейнера.
  */
 @SpringBootTest
-@Testcontainers
+@Testcontainers(disabledWithoutDocker = true)
 abstract class BasePostgresIntegrationTest {
 
     /** Образ PostgreSQL 16 + PostGIS 3.6 + pgRouting 4.0 (соответствует ТЗ: PostgreSQL 14+, PostGIS 3.x, pgRouting). */
@@ -38,18 +39,52 @@ abstract class BasePostgresIntegrationTest {
         checkDockerAvailability();
     }
 
-    @Container
-    static final PostgreSQLContainer<?> POSTGRES = new PostgreSQLContainer<>(
-                    // Кастомный образ (не postgres:*) — явно заявляем Testcontainers,
-                    // что это совместимая замена postgres, иначе падает проверка
-                    // "Failed to verify that image ... is a compatible substitute for 'postgres'".
-                    DockerImageName.parse(POSTGRES_IMAGE).asCompatibleSubstituteFor("postgres"))
-            .withDatabaseName("testdb")
-            .withUsername("test")
-            .withPassword("test")
-            // Один контейнер на всю JVM: переиспользуется всеми классами-наследниками,
-            // Flyway отрабатывает однократно при первом старте контекста Spring.
-            .withReuse(true);
+    // ВАЖНО: без аннотации @Container! Контейнер запускается лениво (см. getPostgres())
+    // и НЕ останавливается после каждого тестового класса.
+    //
+    // Причина регрессии (mvn clean test, падение HybridVisibilityGraphServiceTest с
+    // "HikariPool-1 - Failed to validate connection ... Соединение уже было закрыто"):
+    // при наличии @Container Testcontainers-JUnit 5 обрабатывает статическое поле как
+    // per-class контейнер: перед КАЖДЫМ новым тестовым классом контейнер ОСТАНАВЛИВАЕТСЯ
+    // и стартует заново. Spring же кеширует ApplicationContext между классами, а вместе
+    // с ним — HikariCP-пул с соединениями к порту СТАРОГО контейнера. После перестановки
+    // контейнера пул получает «мёртвые» соединения. При отдельном запуске одного класса
+    // перестановки не происходит — поэтому соло-прогон проходил, а полный — нет.
+    static final PostgreSQLContainer<?> POSTGRES = createContainer();
+
+    /**
+     * Создаёт контейнер PostgreSQL (PostGIS + pgRouting) без запуска.
+     * Запуск выполняется лениво в {@link #getPostgres()}.
+     */
+    private static PostgreSQLContainer<?> createContainer() {
+        return new PostgreSQLContainer<>(
+                // Кастомный образ (не postgres:*) — явно заявляем Testcontainers,
+                // что это совместимая замена postgres, иначе падает проверка
+                // "Failed to verify that image ... is a compatible substitute for 'postgres'".
+                DockerImageName.parse(POSTGRES_IMAGE).asCompatibleSubstituteFor("postgres"))
+                .withDatabaseName("testdb")
+                .withUsername("test")
+                .withPassword("test")
+                // Один контейнер на всю JVM: переиспользуется всеми классами-наследниками,
+                // Flyway отрабатывает однократно при первом старте контекста Spring.
+                .withReuse(true);
+    }
+
+    /**
+     * Ленивый singleton: гарантирует, что контейнер запущен РОВНО ОДИН раз за JVM.
+     *
+     * <p>{@code start()} идемпотентен (GenericContainer проверяет состояние), поэтому
+     * повторные вызовы из разных тестовых классов бесплатны. Контейнер переживает
+     * завершение каждого класса и останавливается только Ryuk-потоном Testcontainers
+     * после окончания всей тестовой JVM — ApplicationContext и HikariCP остаются
+     * валидными для всех наследников.
+     */
+    static PostgreSQLContainer<?> getPostgres() {
+        if (!POSTGRES.isRunning()) {
+            POSTGRES.start();
+        }
+        return POSTGRES;
+    }
 
     /**
      * Переопределяет свойства источника данных Spring реальными параметрами контейнера.
@@ -58,9 +93,11 @@ abstract class BasePostgresIntegrationTest {
      */
     @DynamicPropertySource
     static void overrideDatasourceProps(DynamicPropertyRegistry registry) {
-        registry.add("spring.datasource.url", POSTGRES::getJdbcUrl);
-        registry.add("spring.datasource.username", POSTGRES::getUsername);
-        registry.add("spring.datasource.password", POSTGRES::getPassword);
+        // ЛЕНИВЫЕ supplier-ы: контейнер стартует при ПЕРВОМ ОБРАЩЕНИИ к свойству
+        // (в момент создания контекста), а не при регистрации.
+        registry.add("spring.datasource.url", () -> getPostgres().getJdbcUrl());
+        registry.add("spring.datasource.username", () -> getPostgres().getUsername());
+        registry.add("spring.datasource.password", () -> getPostgres().getPassword());
         registry.add("spring.datasource.driver-class-name", () -> "org.postgresql.Driver");
         registry.add("spring.flyway.enabled", () -> "true");
         registry.add("spring.flyway.locations", () -> "classpath:db/migration");
