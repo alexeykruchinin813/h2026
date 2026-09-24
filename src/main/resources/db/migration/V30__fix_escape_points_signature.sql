@@ -7,6 +7,15 @@
 -- pgjdbc отправляет double как DOUBLE PRECISION (float8), а в V27 параметр объявлен NUMERIC —
 -- PostgreSQL не выполняет неявный implicit cast float8 -> numeric во вызове функции, отсюда PSQLException.
 --
+-- Итерация 2 (test.log 24.09, 18:58): после фикса синтаксиса CTE миграция проходила,
+-- но сам вызов падал: ERROR: column reference "oks_id" is ambiguous (line 3, RETURN QUERY).
+-- Причина: plpgsql подставляет OUT-переменную oks_id (из RETURNS TABLE) в запрос на этапе
+-- парсинга, и она конфликтует с CTE-столбцом/алиасом oks_id. Лечится только переименованием
+-- ВСЕХ внутризапросочных столбцов (oks_uid, oks_ref); имя oks_id допускается лишь как
+-- внешний алиас финального SELECT. В V27 та же ошибка была заложена изначально
+-- (плюс RETURNING id, oks_id при отсутствующей колонке) — V27 больше не активна, т.к.
+-- V30 пересоздаёт функцию; V27 трогать не нужно (Flyway уже применил её checksum).
+--
 -- Архитектурная ловушка (осознанное решение): escape-точки добавляются ПОСЛЕ build_visibility_graph,
 -- поэтому рёбра escape->corner/candidate SQL-графом уже не строятся; escape-вершины остаются
 -- "мостами" только через U6-рёбра ОКС. Если метрика P0-4 (<10 связных ОКС) не сойдётся после этого
@@ -22,9 +31,13 @@ CREATE OR REPLACE FUNCTION create_escape_points(
     p_buffer_dist DOUBLE PRECISION DEFAULT 6.0  -- 5m + 1m margin (типы точно под JDBC-вызов)
 ) RETURNS TABLE(vertex_id BIGINT, oks_id TEXT, geom GEOMETRY) AS $$
 BEGIN
+    -- ВАЖНО: в plpgsql имена OUT-переменных RETURNS TABLE (oks_id) и CTE-столбцов
+    -- с тем же именем конфликтуют: "column reference \"oks_id\" is ambiguous"
+    -- (test.log 24.09, вторая итерация фикса). Все столбцы внутри запроса названы
+    -- oks_uid; на выходе переименовывается в oks_id уже в финальном SELECT.
     RETURN QUERY
     WITH oks_polygons AS (
-        SELECT r.feature_id AS oks_id,
+        SELECT r.feature_id AS oks_uid,
                r.geom_utm AS poly_geom
         FROM input_feature r
         WHERE r.task_id = p_task_id
@@ -40,13 +53,15 @@ BEGIN
           )
     ),
     escape_rings AS (
-        SELECT oks_id,
+        -- DISTINCT: в input_feature могут быть дубли polygons одного feature_id —
+        -- иначе ring-дубли порождают лишние escape-точки.
+        SELECT DISTINCT oks_uid,
                ST_ExteriorRing(ST_Buffer(poly_geom, p_buffer_dist::NUMERIC)) AS ring_geom
         FROM oks_polygons
     ),
     -- Равномерно 8 точек по периметру (escapePointsPerPolygon=8 в Java).
     escape_pts AS (
-        SELECT er.oks_id,
+        SELECT er.oks_uid,
                ST_LineInterpolatePoint(er.ring_geom, frac) AS geom
         FROM escape_rings er,
              LATERAL generate_series(0, 7) AS i,
@@ -57,14 +72,14 @@ BEGIN
     -- syntax error at or near "inserted" (проверено на тесте, test.log 24.09).
     inserted AS (
         INSERT INTO visibility_vertex (task_id, cluster_id, vertex_type, ref_id, geom, own_polygon_id)
-        SELECT DISTINCT ON (p_task_id, p_cluster_id, eps.oks_id, round(ST_X(eps.geom)::NUMERIC, 3), round(ST_Y(eps.geom)::NUMERIC, 3))
-               p_task_id, p_cluster_id, 'escape_point', eps.oks_id, eps.geom, eps.oks_id
+        SELECT DISTINCT ON (p_task_id, p_cluster_id, eps.oks_uid, round(ST_X(eps.geom)::NUMERIC, 3), round(ST_Y(eps.geom)::NUMERIC, 3))
+               p_task_id, p_cluster_id, 'escape_point', eps.oks_uid, eps.geom, eps.oks_uid
         FROM escape_pts eps
-        -- В RETURNING нет колонки oks_id — в таблице visibility_vertex есть только ref_id;
-        -- явный ::TEXT приводит ref_id к OUT-параметру oks_id TEXT.
-        RETURNING id, ref_id::TEXT AS oks_id, geom
+        -- В RETURNING нельзя писать AS oks_id — это имя OUT-переменной plpgsql
+        -- ("column reference \"oks_id\" is ambiguous"); псевдоним даём в финальном SELECT.
+        RETURNING id, ref_id::TEXT AS oks_ref, geom
     )
-    SELECT i.id, i.oks_id, i.geom FROM inserted i;
+    SELECT i.id, i.oks_ref AS oks_id, i.geom FROM inserted i;
 
     -- ==== Мосты escape -> внешние вершины (см. "архитектурная ловушка" выше) ====
     -- Строим рёбра от каждой escape-точки к polygon_corner/candidate/other escape,
