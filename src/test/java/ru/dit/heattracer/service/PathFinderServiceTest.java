@@ -31,7 +31,11 @@ class PathFinderServiceTest extends BasePostgresIntegrationTest {
     private PathFinderService pathFinder;
 
     /**
-     * Создает задачу, две вершины (oks → candidate) и одно ребро между ними.
+     * Создает задачу, три вершины (oks + два candidate) и одно ребро 101→102.
+     *
+     * <p>cluster_id = 0 намеренно: production-код {@code FastVisibilityGraphService.insertEdges}
+     * пишет рёбра с cluster_id = 0, поэтому тестовые данные должны соответствовать прод-поведению,
+     * иначе pgrouting-функция не увидит рёбра в подграфе кластера.
      *
      * @return идентификатор созданной задачи
      */
@@ -39,13 +43,13 @@ class PathFinderServiceTest extends BasePostgresIntegrationTest {
         UUID taskId = UUID.randomUUID();
         jdbc.update("INSERT INTO task (id, status) VALUES (?, 'RUNNING')", taskId);
         jdbc.update("INSERT INTO visibility_vertex (id, task_id, cluster_id, vertex_type, geom) "
-                        + "VALUES (101, ?, 1, 'oks', ST_SetSRID(ST_MakePoint(0, 0), 32637))", taskId);
+                        + "VALUES (101, ?, 0, 'oks', ST_SetSRID(ST_MakePoint(0, 0), 32637))", taskId);
         jdbc.update("INSERT INTO visibility_vertex (id, task_id, cluster_id, vertex_type, geom) "
-                        + "VALUES (102, ?, 1, 'candidate', ST_SetSRID(ST_MakePoint(100, 0), 32637))", taskId);
+                        + "VALUES (102, ?, 0, 'candidate', ST_SetSRID(ST_MakePoint(100, 0), 32637))", taskId);
         jdbc.update("INSERT INTO visibility_vertex (id, task_id, cluster_id, vertex_type, geom) "
-                        + "VALUES (103, ?, 1, 'candidate', ST_SetSRID(ST_MakePoint(500, 0), 32637))", taskId);
+                        + "VALUES (103, ?, 0, 'candidate', ST_SetSRID(ST_MakePoint(500, 0), 32637))", taskId);
         jdbc.update("INSERT INTO visibility_edge (task_id, cluster_id, source_vertex, target_vertex, "
-                        + "geom, length_m, cost, reverse_cost) VALUES (?, 1, 101, 102, "
+                        + "geom, length_m, cost, reverse_cost) VALUES (?, 0, 101, 102, "
                         + "ST_SetSRID(ST_MakeLine(ST_MakePoint(0, 0), ST_MakePoint(100, 0)), 32637), "
                         + "100, 100, 100)", taskId);
         return taskId;
@@ -62,7 +66,7 @@ class PathFinderServiceTest extends BasePostgresIntegrationTest {
     void findPath_shouldReturnReachablePath() {
         UUID taskId = seedSimpleGraph();
         try {
-            var result = pathFinder.findPath(taskId, 1, 101L, 102L);
+            var result = pathFinder.findPath(taskId, 0, 101L, 102L);
 
             assertTrue(result.isFound(), "Путь 101→102 должен существовать");
             assertEquals(1, result.getEdgeCount(), "Путь состоит из одного ребра");
@@ -79,7 +83,7 @@ class PathFinderServiceTest extends BasePostgresIntegrationTest {
     void findPath_shouldReturnNotFoundForDisconnectedVertex() {
         UUID taskId = seedSimpleGraph();
         try {
-            var result = pathFinder.findPath(taskId, 1, 101L, 103L); // 103 не соединена
+            var result = pathFinder.findPath(taskId, 0, 101L, 103L); // 103 не соединена
 
             assertFalse(result.isFound(), "Пути до изолированной вершины 103 быть не должно");
         } finally {
@@ -92,7 +96,7 @@ class PathFinderServiceTest extends BasePostgresIntegrationTest {
     void findPathsFromOks_shouldReturnOnlyReachableCandidates() {
         UUID taskId = seedSimpleGraph();
         try {
-            List<?> paths = pathFinder.findPathsFromOks(taskId, 1, 101L);
+            List<?> paths = pathFinder.findPathsFromOks(taskId, 0, 101L);
 
             assertEquals(1, paths.size(), "Из двух кандидатов достижим ровно один");
         } finally {

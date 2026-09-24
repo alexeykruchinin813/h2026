@@ -109,7 +109,11 @@ public class PathFinderService {
                             rs.getInt("edge_count"),
                             wkt, ids, true));
                 },
-                taskId, clusterId, oksVertex, oksVertex, taskId, clusterId);
+                // Аргументы идут по порядку появления ? в SQL: сначала 4 параметра LATERAL-функции
+                // (task_id, cluster_id, from_vertex, to_vertex=vv.id — привязан к строке, не передаём),
+                // затем task_id и cluster_id для WHERE.
+                taskId, clusterId, oksVertex,
+                taskId, clusterId);
 
         long elapsed = System.currentTimeMillis() - start;
         log.info("[{}] Cluster {}: OKS vertex {} → {} paths found ({} ms)",
