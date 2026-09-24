@@ -52,13 +52,17 @@ BEGIN
              LATERAL generate_series(0, 7) AS i,
              LATERAL (SELECT (i::DOUBLE PRECISION / 8.0) AS frac) f
         WHERE ST_NPoints(er.ring_geom) > 3
-    )
+    ),
+    -- ВАЖНО: запятая после escape_pts обязательна — без неё PostgreSQL падает с
+    -- syntax error at or near "inserted" (проверено на тесте, test.log 24.09).
     inserted AS (
         INSERT INTO visibility_vertex (task_id, cluster_id, vertex_type, ref_id, geom, own_polygon_id)
         SELECT DISTINCT ON (p_task_id, p_cluster_id, eps.oks_id, round(ST_X(eps.geom)::NUMERIC, 3), round(ST_Y(eps.geom)::NUMERIC, 3))
                p_task_id, p_cluster_id, 'escape_point', eps.oks_id, eps.geom, eps.oks_id
         FROM escape_pts eps
-        RETURNING id, oks_id, geom
+        -- В RETURNING нет колонки oks_id — в таблице visibility_vertex есть только ref_id;
+        -- явный ::TEXT приводит ref_id к OUT-параметру oks_id TEXT.
+        RETURNING id, ref_id::TEXT AS oks_id, geom
     )
     SELECT i.id, i.oks_id, i.geom FROM inserted i;
 
