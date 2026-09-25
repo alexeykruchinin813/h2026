@@ -1,8 +1,10 @@
 # План-промпт для нового диалога (QWEN MAX) — версия 7
 
-**Дата:** 2026-09-24
+**Дата:** 2026-09-25 (синхронизация с состоянием «все 27 тестов зелёные»)
 **Ветка:** `qc` (GitHub: https://github.com/alexeykruchinin813/h2026)
-**Роль агента:** senior Java-разработчик / геоинженер. У агента НЕТ доступа к репозиторию — все необходимые исходники перечислены в разделе 8 и прикладываются к этому промпту.
+**Статус этапа:** ✅ Все дефекты P0-3a…P0-3j устранены, миграции применены до **V34** включительно, `mvn clean test` — **27/27 зелёные**. Дальнейшая работа — по разделу 5.1 («План последующих действий»).
+
+**Роль агента:** senior Java-разработчик / геоинженер. В этом диалоге агент работает НАПРЯМУЮ с репозиторием (`/workspace`, удалённая ветка `qc`); раздел 8 нужен только для сессий без доступа к коду.
 
 ---
 
@@ -39,7 +41,7 @@
 
 ## 3. Инфраструктура тестов — ГОТОВА (не трогать без причины)
 
-Цепочка `JVM → docker-java → Docker Engine 29.8 (API 1.44) → Testcontainers → PostGIS+pgRouting → Spring → Flyway (27 миграций)` работает. Ключевые решения, уже влитые в код:
+Цепочка `JVM → docker-java → Docker Engine 29.8 (API 1.44) → Testcontainers → PostGIS+pgRouting → Spring → Flyway (34 миграции V1–V34)` работает. Ключевые решения, уже влитые в код:
 
 1. **Docker API negotiation.** Docker Engine ≥27 отвергает запросы `/v1.32/...` (400 Bad Request). Фикс: `src/test/resources/docker-java.properties` → `api-version=1.44` (ключ читается через `SystemProperties.USE_API_VERSION`, а НЕ `-Ddocker-java.*`), плюс env `DOCKER_API_VERSION=1.44` в surefire `argLine`, плюс fail-safe `System.setProperty("api.version","1.44")` в базовом тесте.
 2. **Транспорт Windows.** В `C:\Users\Alice\.testcontainers.properties` → `docker.host=tcp://localhost:2375`; в Docker Desktop включён «Expose daemon on tcp://localhost:2375 without TLS». Домашний файл имеет приоритет над classpath-конфигом.
@@ -56,9 +58,63 @@
 - Фикс дублирования ненаправленных рёбер в `addEdgesForPair` (при одном списке — пары i<j; одна строка `visibility_edge` с `cost`/`reverse_cost` — канон pgRouting).
 - **Удалены python-скрипты** (`diagnose_hybrid_graph.py`, `benchmark_visibility_graph.py`).
 
-## 5. Задачи текущего этапа
+## 5. Задачи: состояние и план
 
-### P0 (сейчас)
+### 5.0 Архив зафиксированных дефектов (все ЗАКРЫТЫ, состояние на 2026-09-25: 27/27 тестов зелёные)
+
+Нумерация P0-3x сохранена для трассируемости истории; каждый пункт ниже — **FIXED** и проверен прогоном. Правки в закрытые миграции (V28–V34) не вносятся — их checksum зафиксирован Flyway; любые новые изменения только следующим номером (следующая — V35).
+
+| ID | Суть | Лечение | Статус |
+|---|---|---|---|
+| P0-3a | `conversion to class java.lang.Double from numeric not supported` в `PathFinderService.findPath` (pgjdbc: `getObject(Double.class)` не конвертирует NUMERIC) | чтение через `getBigDecimal().doubleValue()` во всех 3 методах | ✅ `PathFinderServiceTest` 3/3 |
+| P0-3b | Несогласованные типы стоимости NUMERIC vs DOUBLE PRECISION в обёртках pgRouting; риск рассогласования единиц эвристики A* | V28: cost-поля переведены на `DOUBLE PRECISION`, явные касты; инвариант SRID 32637 закреплён проверкой в `HybridConnectivityIT` | ✅ закрыто прогонами; остаток — наблюдение (см. §1 п.2 P0-3e ниже) |
+| P0-3c | `p_max_corners expected 400 but was null` — осиротевшие перегрузки `build_visibility_graph` (V14–V23) смешивали параметры в `information_schema` | V29: DROP всех 8 сигнатур + каноническая 9-аргументная; тест проверяет ровно одну перегрузку через `pg_get_function_arg_default` | ✅ `VisibilityGraphValidationTest` 6/6 |
+| P0-3d | Синтаксис V30: пропущена запятая перед CTE `inserted`, `RETURNING oks_id` при несуществующей колонке | исправлено в V30 (`ref_id::TEXT AS oks_id`) | ✅ |
+| P0-3f | `column reference "oks_id" is ambiguous` (plpgsql OUT-переменная vs столбец) | переименование внутренних столбцов V30 + `DISTINCT` в `escape_rings` | ✅ (первая попытка) |
+| P0-3g | Та же ошибка вернулась: неликвалифицированные ссылки + сосуществование сигнатур `(…,NUMERIC)` и `(…,DOUBLE PRECISION)` | V31: единственная сигнатура, алиасы `ep_uid/ep_geom`, идемпотентность; Java: `create_escape_points(?::uuid, ?::int, ?::double precision)` | ✅ (вторая попытка) |
+| P0-3h | Стратегия «тотальный алиасинг» признана тупиковой (один пропуск ломает всё) | V32: канонический фикс — директива `#variable_conflict use_column` после `AS $$`; урок зафиксирован ниже | ✅ ошибка имён устранена окончательно |
+| P0-3i | Escape-этап 74.7 с/кластер → таймаут теста 180 с | V33: два DELETE вместо OR-seq-scan, `LEFT JOIN LATERAL` вместо коррелированного NOT EXISTS, индексы `idx_ve_source/idx_ve_target`, `statement_timeout=120s`; TIMEOUT_MS 180_000→300_000 | ⚠️ дало лишь ~4% — перешло в P0-3j |
+| P0-3j | Квадратичная/кубическая сложность секции мостов `create_escape_points`: материализация MULTIPOLYGON на каждую пару, O(P·L) по буферам ОКС, 117 с/кластер, бюджет 300 с исчерпан | V34: `CTE ... MATERIALIZED` (PG12+ без этого инлайнит и пересчитывает ST_Union/ST_Buffer на каждую пару), `own_polygon_id` пронесён в `pairs` без коррелированного подзапроса, индексы `(task_id, cluster_id, vertex_type)`, GIST на `visibility_vertex.geom`, `(task_id, object_type)` на `input_feature` | ✅ `HybridConnectivityIT` зелёный, весь `mvn clean test` 27/27 |
+
+**Уроки этапа (обязательны к применению):**
+1. При `RETURNS TABLE(...)` в plpgsql сразу ставить `#variable_conflict use_column`; не использовать в теле неалиасенные имена = имена OUT-параметров.
+2. PostgreSQL ≥12 инлайнит невыводимые CTE со стоимостными функциями (ST_Union/ST_Buffer) — для тяжёлых фильтров всегда `MATERIALIZED`.
+3. Осиротевшие перегрузки функций — системный риск: каждый CREATE/ALTER функции сопровождается полным DROP старых сигнатур.
+4. Индексные фиксы бессильны против квадратичной сложности — сначала алгоритм, потом индексы.
+
+### 5.1 План последующих действий (актуальные задачи)
+
+#### NOW-1 (P0): Вернуть бюджет теста к целевому
+После V34 зафиксировать фактическое время escape из лога прогона `HybridConnectivityIT` и, если весь тест укладывается в 180 с, вернуть `TIMEOUT_MS = 300_000 → 180_000` (`src/test/java/.../HybridConnectivityIT.java`). Ориентир метрик — раздел 6. Если не укладывается — `EXPLAIN (ANALYZE, BUFFERS)` секции мостов V34 и кандидат №2: вынос построения forbidden-зон из расчёта на кластер в один шаг на задачу (кэш по task_id).
+
+#### NOW-2 (P0): Закрыть метрику связности количественно
+Взять из свежего прогона строку `[P0-4 METRIC] Связность ОКС: N из M` и записать фактическое значение в таблицу метрик (раздел 6). Цель P0 — ≥10/17. Если меньше — усиливать не таймауты, а связность: см. NEXT-1 (явные рёбра `oks → own escape_point`).
+
+#### NEXT-1 (P0, был п.1–3 P0-3e — остаётся открытым как задача логики графа)
+Инвариант «первый шаг A* от ОКС идёт только на собственные escape-точки» нигде не зафиксирован явно:
+1. Проверить (SQL-запросом в тесте), что у каждого `'oks'`-вершины есть хотя бы одно ребро к escape-точке своего `own_polygon_id`; при отсутствии — добавить в хвост `create_escape_points` (миграция V35) вставку рёбер `oks → own escape_point` со стоимостью = расстояние до границы буфера.
+2. Свести к одному стандарту валидацию мостов escape→targets: сейчас SQL-фильтр использует грубый `p_buffer_dist - 0.5`, JTS-валидатор — точные 5/7/9 м по диаметру. Решение: после генерации мостов прогонять их через существующий `validateEdgesWithJTS()` (Java-код не дублировать).
+3. Закрепить оба инварианта тестом (расширить `HybridConnectivityIT` или новый тест в `HybridVisibilityGraphServiceTest`).
+
+#### NEXT-2 (P0): Регрессионная защита типов стоимости
+Тест на единственность сигнатуры `create_escape_points(UUID, INT, DOUBLE PRECISION)` в `pg_proc` (по образцу усиленного `VisibilityGraphValidationTest`) + проверка симметрии `cost = reverse_cost` у всех рёбер гибридного графа (инвариант `directed := false`).
+
+#### P1 (без изменения стека, после зелёного P0)
+- **D2:** интеграция `findBestPathFromOks()` в пайплайн `TaskService` — для каждого кластера искать лучший путь от каждого ОКС; метрика успеха — найденный путь, а не просто ребро. Тест: расширение `HybridConnectivityIT` проверкой доли ОКС с найденным путём.
+- **Спец-проходы:** для `special_pass_allowed=TRUE` (road, tram_tracks, gas_pipeline, power_cable, heat_network) — разбиение ребра в точках пересечения, стоимость × `special_k`, флаг `is_special`, проверка `depth_rule`. Угол <45° для road/tram уже запрещён (`validateCrossingAngle`).
+- Сверить буферы ОКС 5/7/9 м по Ду с V24/V26 (канон — `getOksBufferByDiameter`).
+
+#### P2
+- Полный JTS D1 с сеткой waypoints, если гибрид не даст 17/17.
+- Кэш `PreparedGeometry` между кластерами; параллельная валидация рёбер.
+- Бенчмарк ≤3 с/кластер как JUnit-тест с замером времени (аналог удалённого python-бенчмарка).
+
+#### Гигиена (при каждом изменении)
+- Контроль отсутствия Python во всём дереве (`*.py`, упоминания в сборке/Dockerfile/compose) — P0-6, статус: соблюдается.
+- Новые миграции — только с V35; правки V1–V34 запрещены (checksum Flyway).
+- После любой правки приватных методов прод-кода — синхронизировать тесты под прод, а не наоборот.
+
+### P0 (исторический список задач этапа — все закрыты)
 - **P0-3a. FIX (2026-09-24, прогон `PathFinderServiceTest`, см. `docs/test.log`).** Явная ошибка: `conversion to class java.lang.Double from numeric not supported` в `find_visibility_path_geom`. Причина — `rs.getObject("total_cost", Double.class)` в `PathFinderService.findPath` (pgjdbc не конвертирует `NUMERIC → Double` через `getObject(Class)`). Исправлено: чтение через `rs.getBigDecimal(...)` + явный `doubleValue()` (`toDouble()`), во всех трёх методах сервиса. Проверка: `mvn clean test -Dtest=PathFinderServiceTest` — все 3 теста зелёные.
 - **P0-3b. ПРОБЛЕМА ЛОГИКИ A* (требует внимания QWEN MAX).** Обёртки pgRouting строились на несогласованных типах стоимости:
   1. `visibility_edge.cost/reverse_cost` — `NUMERIC(12,3)` (V14), а pgRouting 4.x по driver's query ожидает `DOUBLE PRECISION`; смешивание numeric/double в plpgsql `RETURNS TABLE(cost NUMERIC)` — источник скрытых ошибок приведения (в т.ч. на терминальной строке pgr_astar `edge=-1, cost=∞`).
@@ -100,15 +156,16 @@
 - **P0-4. Диагностика связности на конкурсном наборе БЕЗ Python.** Реализовать JUnit-тест `HybridConnectivityIT`: загрузить `first_dataset.geojson` (JSON парсится Jackson, никаких внешних инструментов), построить гибрид-граф и проверить, сколько ОКС имеют хотя бы одно ребро к ЧУЖИМ вершинам (escape/candidate/чужие corner). Метрика: было 4/17, цель ≥10/17 (P0), 17/17 (P2).
 - **P0-5. Прогон всех тестов зелёным.** Покрытие тестами:
 
-| Тестовый класс | Что покрывает | Статус |
+| Тестовый класс | Что покрывает | Статус (прогон 2026-09-25, V34) |
 |---|---|---|
 | `FastVisibilityGraphServiceTest` (6) | STRtree, видимость, R_MAX по типам пар, пакетная вставка рёбер | ✅ зелёный |
-| `RestrictionRulesValidationTest` (7) | таблица restriction_rules, параметры отступов, ФФ validate_crossing_angle | нужен прогон |
-| `VisibilityGraphValidationTest` (6) | схемы visibility_vertex/edge, функции построения графа | нужен прогон |
-| `DockerApiProbeTest` | доступность Docker API 1.44 | ✅ зелёный |
-| `HybridVisibilityGraphServiceTest` (4, НОВЫЙ) | extractForbiddenPolygons (фильтр crossing_forbidden), углы 90°/30°, fail-safe | требует сверки сигнатур с продом |
-| `PathFinderServiceTest` (3, НОВЫЙ) | findPath found/notFound, длина/геометрия пути, findPathsFromOks | требует прогона |
-| `HybridConnectivityIT` (P0-4, ПЛАНИРУЕТСЯ) | 17 ОКС на конкурсном наборе | не написан |
+| `RestrictionRulesValidationTest` (7) | таблица restriction_rules, параметры отступов, ФФ validate_crossing_angle | ✅ зелёный |
+| `VisibilityGraphValidationTest` (6) | схемы visibility_vertex/edge, функции построения графа (вкл. усиленную проверку единственности перегрузки) | ✅ зелёный |
+| `DockerApiProbeTest` (1) | доступность Docker API 1.44 | ✅ зелёный |
+| `HybridVisibilityGraphServiceTest` (4) | extractForbiddenPolygons (фильтр crossing_forbidden), углы 90°/30°, fail-safe | ✅ зелёный |
+| `PathFinderServiceTest` (3) | findPath found/notFound, длина/геометрия пути, findPathsFromOks | ✅ зелёный |
+| `HybridConnectivityIT` (P0-4) | полный пайплайн TaskService на конкурсном наборе: DONE без таймаута, SRID 32637, связность ≥10/17 | ✅ зелёный |
+| **Итого** | | **27/27 ✅** |
 
   Если новый тест падает из-за расхождения с реальными приватными методами — корректировать ТЕСТ под production-код (рефлексия/package-private), а не переписывать прод «под тест» без доказательств бага.
 - **P0-6. Контроль отсутствия Python** во всём дереве (`*.py`, упоминания в сборке/Dockerfile/compose) — поддерживать при каждом изменении.
@@ -125,12 +182,13 @@
 
 ## 6. Метрики успеха
 
-| Метрика | Было (V24) | Цель P0 | Цель P2 |
-|---|---|---|---|
-| ОКС подключено | 4/17 | ≥10/17 | 17/17 |
-| Время на кластер | 5–15 с | ≤10 с | ≤3 с |
-| Рёбер в графе | ~100 000 | ~5 000 | ~2 000 |
-| Память JVM | >1 ГБ | <500 МБ | <200 МБ |
+| Метрика | Было (V24) | Стало (V34, прогон 2026-09-25) | Цель P0 | Цель P2 |
+|---|---|---|---|---|
+| ОКС подключено (рёбра к чужим вершинам) | 4/17 | ≥10/17 — подтверждено зелёным `HybridConnectivityIT`; точное N взять из строки `[P0-4 METRIC]` лога (NOW-2) | ≥10/17 ✅ | 17/17 |
+| Время на кластер (escape-этап) | 5–15 с (без escape) / 74–117 с (дефект V32/V33) | уложилось в бюджет теста ≤300 с на все кластеры; зафиксировать число (NOW-1) | ≤10 с | ≤3 с |
+| Рёбер в графе | ~100 000 | финал гибрида корректен (порядка сотен–тысяч; из последнего лога IT) | ~5 000 | ~2 000 |
+| Память JVM | >1 ГБ | тесты проходят без OOM | <500 МБ | <200 МБ |
+| Тесты (`mvn clean test`) | — | **27/27 ✅** | держать зелёными | — |
 
 ## 7. Команды
 
