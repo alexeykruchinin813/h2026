@@ -216,6 +216,67 @@ class VisibilityGraphValidationTest extends BasePostgresIntegrationTest {
     }
 
     /**
+     * NEXT-2.1 (P0-3c-регрессия): в pg_proc должна быть ровно ОДНА активная
+     * сигнатура create_escape_points — (uuid, integer, double precision).
+     *
+     * Историю см. P0-3c: осиротевшие перегрузки V14–V23 ломали чтение defaults
+     * через information_schema.parameters. Проверяем через pg_proc OID —
+     * надёжнее, чем information_schema (там строки разных версий смешиваются).
+     *
+     * NUMERIC-сигнатуру явно запрещаем: с V31 она не должна существовать
+     * (Java вызывает ?::double precision, NUMERIC ломает резолвинг).
+     */
+    @Test
+    @DisplayName("NEXT-2.1: create_escape_points — единственная сигнатура (uuid, integer, double precision)")
+    void testCreateEscapePointsSingleSignature() {
+        List<Map<String, Object>> sigs = jdbcTemplate.queryForList(
+                "SELECT p.oid::regprocedure::text            AS sig, " +
+                        "       pg_get_function_arguments(p.oid)     AS args, " +
+                        "       pg_get_function_identity_arguments(p.oid) AS id_args " +
+                        "FROM pg_proc p " +
+                        "JOIN pg_namespace n ON n.oid = p.pronamespace " +
+                        "WHERE n.nspname = 'public' " +
+                        "  AND p.proname = 'create_escape_points' " +
+                        "  AND p.prokind = 'f'");
+
+        assertEquals(1, sigs.size(),
+                "Ожидали ровно одну сигнатуру create_escape_points, найдено: " + sigs);
+
+        String idArgs = (String) sigs.get(0).get("id_args");
+        assertNotNull(idArgs, "pg_get_function_identity_arguments вернул null");
+
+        assertTrue(idArgs.contains("uuid"),                "нет uuid в сигнатуре: " + idArgs);
+        assertTrue(idArgs.contains("integer"),             "нет integer в сигнатуре: " + idArgs);
+        assertTrue(idArgs.contains("double precision"),    "нет double precision в сигнатуре: " + idArgs);
+
+        assertFalse(idArgs.contains("numeric"),
+                "NUMERIC-сигнатура должна быть удалена (V31, P0-3g), найдено: " + idArgs);
+    }
+
+    /**
+     * NEXT-2.2 (P0-3b п.3): инвариант directed:=false — cost и reverse_cost
+     * у всех рёбер графа обязаны совпадать.
+     *
+     * Нарушение означает, что pgRouting с directed:=false посчитает разные
+     * стоимости в прямом и обратном направлениях, что тихо разъедет A*.
+     */
+    @Test
+    @DisplayName("NEXT-2.2: cost = reverse_cost для всех рёбер (directed:=false)")
+    void testCostSymmetry() {
+        UUID taskId = latestFinishedTaskId();
+
+        Long asymmetric = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM visibility_edge " +
+                        "WHERE task_id = ? " +
+                        "  AND (cost IS NULL OR reverse_cost IS NULL OR cost <> reverse_cost)",
+                Long.class, taskId);
+
+        assertNotNull(asymmetric, "Запрос симметрии вернул null");
+        assertEquals(0L, asymmetric.longValue(),
+                "Нарушение directed:=false: " + asymmetric + " рёбер с cost <> reverse_cost");
+    }
+
+    /**
      * Вспомогательный метод для проверки значений по умолчанию с учётом возможных суффиксов типов БД.
      *
      * @param defaults       карта параметров

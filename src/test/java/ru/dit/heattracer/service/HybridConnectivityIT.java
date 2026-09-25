@@ -23,9 +23,9 @@ import static org.junit.jupiter.api.Assertions.*;
 @DisplayName("Интеграционный тест связности гибридного графа (P0-4)")
 class HybridConnectivityIT extends BasePostgresIntegrationTest {
 
-    private static final int P0_TARGET_CONNECTED = 10;
+    private static final int P0_TARGET_CONNECTED = 16;
     private static final String TEST_DATASET_RESOURCE = "first_dataset.geojson";
-    private static final long TIMEOUT_MS = 300_000; // 5 минут: escape-этап ~75с/кластер до оптимизации V33
+    private static final long TIMEOUT_MS = 180_000; // 5 минут: escape-этап ~75с/кластер до оптимизации V33
     private static final long POLL_INTERVAL_MS = 1_000;
 
     @Autowired
@@ -112,6 +112,13 @@ class HybridConnectivityIT extends BasePostgresIntegrationTest {
 
         System.out.printf("[P0-4 METRIC] Связность ОКС: %d из %d имеют рёбра к чужим вершинам. Всего рёбер: %d%n",
                 connectedOksCount, totalOksCount, totalEdges);
+
+        // WARN, но не FAIL: полная связность (17/17) — текущий факт, любой откат от неё фиксируем.
+        if (connectedOksCount < totalOksCount) {
+            System.out.printf("[P0-4 WARN] %d ОКС без рёбер к чужим вершинам — регресс от V34 (17/17). " +
+                            "Проверь escape_points и валидатор мостов.%n",
+                    totalOksCount - connectedOksCount);
+        }
 
         // 7. Проверка метрики P0
         int targetConnected = Math.min(P0_TARGET_CONNECTED, totalOksCount);

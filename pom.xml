@@ -218,6 +218,11 @@
                 <configuration>
                     <!-- Не обрезать стектрейсы: иначе причина ExceptionInInitializerError не видна -->
                     <trimStackTrace>false</trimStackTrace>
+                    <runOrder>alphabetical</runOrder>
+                    <includes>
+                        <include>**/*Test.java</include>
+                        <include>**/*IT.java</include>
+                    </includes>
                     <!-- Дублируем версию Docker API через ENV: docker-java читает
                          DOCKER_API_VERSION из окружения (classpath docker-java.properties — запасной путь).
                          Java-код задать это НЕ может (JVM уже запущена), поэтому фиксируем в pom. -->
