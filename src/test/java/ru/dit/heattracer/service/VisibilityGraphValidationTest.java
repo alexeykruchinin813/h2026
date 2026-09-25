@@ -7,6 +7,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -18,6 +19,11 @@ import static org.junit.jupiter.api.Assertions.*;
  * 2. Время выполнения build_visibility_graph()
  * 3. Connectivity (все OKS достигают кандидатов)
  * 4. Длина маршрутов (не должна вырасти >10%)
+ *
+ * <p>ВАЖНО: контейнер Testcontainers переиспользуется между прогонами ({@code withReuse(true)}),
+ * поэтому счётные проверки скоупятся по id самой свежей завершённой задачи
+ * ({@link #latestFinishedTaskId()}) — иначе запросы «по всей БД» подмешивают
+ * данные прошлых прогонов и метрики заведомо падают.
  */
 @DisplayName("Валидация графа видимости")
 class VisibilityGraphValidationTest extends BasePostgresIntegrationTest {
@@ -25,17 +31,34 @@ class VisibilityGraphValidationTest extends BasePostgresIntegrationTest {
     @Autowired
     private JdbcTemplate jdbcTemplate;
 
+    /**
+     * Возвращает id самой свежей завершённой задачи — той, что оставил HybridConnectivityIT.
+     * Все счётные тесты в этом классе должны скоупиться по ней, иначе reused-контейнер
+     * подмешивает данные прошлых прогонов.
+     */
+    private UUID latestFinishedTaskId() {
+        return jdbcTemplate.queryForObject(
+            "SELECT id FROM task " +
+            "WHERE finished_at IS NOT NULL " +
+            "ORDER BY finished_at DESC " +
+            "LIMIT 1",
+            UUID.class
+        );
+    }
+
     @Test
     @DisplayName("build_visibility_graph возвращает разумное количество вершин")
     void testVisibilityGraphVertexCount() {
         // После оптимизации p_max_corners=400, должно быть < 600 вершин на кластер
         // (400 corners + ~50 oks + ~50 candidates максимум)
-        
+        UUID taskId = latestFinishedTaskId();
+
         List<Map<String, Object>> results = jdbcTemplate.queryForList(
             "SELECT cluster_id, COUNT(*) as vertex_count " +
             "FROM visibility_vertex " +
-            "WHERE task_id IS NOT NULL " +
-            "GROUP BY cluster_id"
+            "WHERE task_id = ? " +
+            "GROUP BY cluster_id",
+            taskId
         );
 
         for (Map<String, Object> row : results) {
@@ -49,11 +72,14 @@ class VisibilityGraphValidationTest extends BasePostgresIntegrationTest {
     @Test
     @DisplayName("Рёбра графа имеют корректные cost/reverse_cost")
     void testEdgeCosts() {
+        UUID taskId = latestFinishedTaskId();
+
         List<Map<String, Object>> edges = jdbcTemplate.queryForList(
             "SELECT id, length_m, cost, reverse_cost, is_special, special_k " +
             "FROM visibility_edge " +
-            "WHERE task_id IS NOT NULL " +
-            "LIMIT 100"
+            "WHERE task_id = ? " +
+            "LIMIT 100",
+            taskId
         );
 
         for (Map<String, Object> edge : edges) {
@@ -72,11 +98,14 @@ class VisibilityGraphValidationTest extends BasePostgresIntegrationTest {
     @Test
     @DisplayName("Специальные рёбра имеют special_k коэффициент")
     void testSpecialEdgesHaveCoefficient() {
+        UUID taskId = latestFinishedTaskId();
+
         List<Map<String, Object>> specialEdges = jdbcTemplate.queryForList(
             "SELECT id, is_special, special_k, crossings " +
             "FROM visibility_edge " +
-            "WHERE task_id IS NOT NULL AND is_special = TRUE " +
-            "LIMIT 50"
+            "WHERE task_id = ? AND is_special = TRUE " +
+            "LIMIT 50",
+            taskId
         );
 
         for (Map<String, Object> edge : specialEdges) {
@@ -92,21 +121,24 @@ class VisibilityGraphValidationTest extends BasePostgresIntegrationTest {
     @Test
     @DisplayName("OKS вершины соединены с кандидатами (connectivity check)")
     void testOksConnectivity() {
+        UUID taskId = latestFinishedTaskId();
+
         // Проверяем, что у каждой OKS вершины есть исходящие рёбра
         List<Map<String, Object>> oksVertices = jdbcTemplate.queryForList(
             "SELECT id, cluster_id FROM visibility_vertex " +
-            "WHERE vertex_type = 'oks' AND task_id IS NOT NULL " +
-            "LIMIT 100"
+            "WHERE vertex_type = 'oks' AND task_id = ? " +
+            "LIMIT 100",
+            taskId
         );
 
         int connectedCount = 0;
         for (Map<String, Object> oks : oksVertices) {
             Long oksId = ((Number) oks.get("id")).longValue();
-            
+
             List<Long> edges = jdbcTemplate.queryForList(
                 "SELECT id FROM visibility_edge " +
-                "WHERE source_vertex = ? AND task_id IS NOT NULL",
-                Long.class, oksId
+                "WHERE source_vertex = ? AND task_id = ?",
+                Long.class, oksId, taskId
             );
 
             if (!edges.isEmpty()) {
@@ -127,20 +159,24 @@ class VisibilityGraphValidationTest extends BasePostgresIntegrationTest {
     void testPolygonSimplification() {
         // Проверяем, что corner вершины имеют упрощённую геометрию
         // (количество corners должно быть значительно меньше чем без упрощения)
-        
+        UUID taskId = latestFinishedTaskId();
+
+        // polygon_count считается ТОЛЬКО по polygon_corner (distinct ref_id среди
+        // всех типов вершин завышает знаменатель/подмешивает OKS/candidate/escape_point).
         Map<String, Object> stats = jdbcTemplate.queryForMap(
             "SELECT " +
-            "   COUNT(*) FILTER (WHERE vertex_type = 'polygon_corner') as corner_count, " +
-            "   COUNT(DISTINCT ref_id) as polygon_count " +
+            "  COUNT(*) FILTER (WHERE vertex_type = 'polygon_corner') AS corner_count, " +
+            "  COUNT(DISTINCT ref_id) FILTER (WHERE vertex_type = 'polygon_corner') AS polygon_count " +
             "FROM visibility_vertex " +
-            "WHERE task_id IS NOT NULL"
+            "WHERE task_id = ?",
+            taskId
         );
 
         Number cornerCount = (Number) stats.get("corner_count");
         Number polygonCount = (Number) stats.get("polygon_count");
-        
-        if (polygonCount != null && polygonCount instanceof Number) {
-            double avgCornersPerPolygon = cornerCount.doubleValue() / Math.max(1, polygonCount.intValue());
+
+        if (polygonCount != null && polygonCount.longValue() > 0) {
+            double avgCornersPerPolygon = cornerCount.doubleValue() / polygonCount.longValue();
             // При tolerance=2.0м ожидается ~10-50 corners на полигон вместо 100+
             assertTrue(avgCornersPerPolygon < 100,
                 "Слишком много corners на полигон: " + avgCornersPerPolygon + 
