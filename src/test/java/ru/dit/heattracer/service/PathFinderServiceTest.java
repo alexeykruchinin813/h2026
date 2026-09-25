@@ -40,6 +40,13 @@ class PathFinderServiceTest extends BasePostgresIntegrationTest {
      * @return идентификатор созданной задачи
      */
     private UUID seedSimpleGraph() {
+        // Reused Testcontainers: если прошлый прогон упал до cleanup(),
+        // строки с id 101..103 остались. Удаляем их до вставки (идемпотентность).
+        jdbc.update("DELETE FROM visibility_edge "
+                + "WHERE source_vertex IN (101, 102, 103) "
+                + "   OR target_vertex IN (101, 102, 103)");
+        jdbc.update("DELETE FROM visibility_vertex WHERE id IN (101, 102, 103)");
+
         UUID taskId = UUID.randomUUID();
         jdbc.update("INSERT INTO task (id, status) VALUES (?, 'RUNNING')", taskId);
         jdbc.update("INSERT INTO visibility_vertex (id, task_id, cluster_id, vertex_type, geom) "

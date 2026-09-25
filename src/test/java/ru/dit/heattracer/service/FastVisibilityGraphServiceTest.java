@@ -161,6 +161,12 @@ class FastVisibilityGraphServiceTest extends BasePostgresIntegrationTest {
     @Test
     @DisplayName("Пакетная вставка рёбер работает корректно")
     void testBatchInsert() {
+        // Убираем возможные «залежи» id=1..4 от прошлых прогонов на reused-контейнере
+        jdbcTemplate.update("DELETE FROM visibility_edge "
+                + "WHERE source_vertex IN (1, 2, 3, 4) "
+                + "   OR target_vertex IN (1, 2, 3, 4)");
+        jdbcTemplate.update("DELETE FROM visibility_vertex WHERE id IN (1, 2, 3, 4)");
+
         UUID taskId = UUID.randomUUID();
 
         // Создаём тестовую запись задачи
