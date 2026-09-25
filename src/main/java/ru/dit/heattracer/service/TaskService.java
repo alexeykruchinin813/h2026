@@ -276,6 +276,8 @@ public class TaskService {
 
             log.info("[{}] Total paths found: {}, OKS without path: {}",
                     id, totalPaths, totalOksWithoutPath);
+            System.out.printf("[P1-1 METRIC] ОКС с найденным путём: %d из %d%n",
+                    totalPaths, totalPaths + totalOksWithoutPath);
 
             state.setPercent(92);
             state.setStage("PATHS_FOUND");
