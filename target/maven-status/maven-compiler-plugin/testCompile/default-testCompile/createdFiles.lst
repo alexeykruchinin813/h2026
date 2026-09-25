@@ -1,0 +1,8 @@
+ru/dit/heattracer/service/VisibilityGraphValidationTest.class
+ru/dit/heattracer/service/FastVisibilityGraphServiceTest.class
+ru/dit/heattracer/service/RestrictionRulesValidationTest.class
+ru/dit/heattracer/service/HybridConnectivityIT.class
+ru/dit/heattracer/service/BasePostgresIntegrationTest.class
+ru/dit/heattracer/service/HybridVisibilityGraphServiceTest.class
+ru/dit/heattracer/service/DockerApiProbeTest.class
+ru/dit/heattracer/service/PathFinderServiceTest.class

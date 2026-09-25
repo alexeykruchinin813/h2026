@@ -1,0 +1,228 @@
+From b7aea2a1acf5ecfbcc26162128448e4144fcf15e Mon Sep 17 00:00:00 2001
+From: "qwen.ai[bot]" <qwenlm-intl@service.alibaba.com>
+Date: Fri, 25 Sep 2026 04:10:49 +0000
+Subject: [PATCH] =?UTF-8?q?test:=20=D0=B8=D0=B4=D0=B5=D0=BC=D0=BF=D0=BE?=
+ =?UTF-8?q?=D1=82=D0=BD=D0=BE=D1=81=D1=82=D1=8C=20=D1=82=D0=B5=D1=81=D1=82?=
+ =?UTF-8?q?=D0=BE=D0=B2=20=D0=B4=D0=BB=D1=8F=20reused=20Testcontainers-?=
+ =?UTF-8?q?=D0=BA=D0=BE=D0=BD=D1=82=D0=B5=D0=B9=D0=BD=D0=B5=D1=80=D0=B0?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- PathFinderServiceTest.seedSimpleGraph: DELETE stale id 101..103 перед вставкой
+- FastVisibilityGraphServiceTest.testBatchInsert: DELETE stale id 1..4
+- VisibilityGraphValidationTest: скоуп всех запросов по latestFinishedTaskId()
+  вместо 'WHERE task_id IS NOT NULL'; polygon_count через FILTER (polygon_corner)
+
+Устраняет 3x DuplicateKey, 3656<800 vertices, 103.22<100 corners/polygon
+---
+ .gitignore                                    |  3 +-
+ .../FastVisibilityGraphServiceTest.java       |  7 ++
+ .../service/PathFinderServiceTest.java        |  8 +++
+ .../VisibilityGraphValidationTest.java        | 70 ++++++++++++++-----
+ 4 files changed, 71 insertions(+), 17 deletions(-)
+
+diff --git a/.gitignore b/.gitignore
+index cfa61fd..6c35253 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1 +1,2 @@
+-(empty)
+\ No newline at end of file
++# Build output
++target/
+\ No newline at end of file
+diff --git a/src/test/java/ru/dit/heattracer/service/FastVisibilityGraphServiceTest.java b/src/test/java/ru/dit/heattracer/service/FastVisibilityGraphServiceTest.java
+index 20f6a75..5a0f84a 100644
+--- a/src/test/java/ru/dit/heattracer/service/FastVisibilityGraphServiceTest.java
++++ b/src/test/java/ru/dit/heattracer/service/FastVisibilityGraphServiceTest.java
+@@ -161,6 +161,13 @@ class FastVisibilityGraphServiceTest extends BasePostgresIntegrationTest {
+     @Test
+     @DisplayName("Пакетная вставка рёбер работает корректно")
+     void testBatchInsert() {
++        // Reused Testcontainers: убираем возможные «залежи» id=1..4 от прошлых прогонов,
++        // иначе INSERT вершин с жёстко зашитыми id падает с DuplicateKey.
++        jdbcTemplate.update("DELETE FROM visibility_edge "
++                + "WHERE source_vertex IN (1, 2, 3, 4) "
++                + "   OR target_vertex IN (1, 2, 3, 4)");
++        jdbcTemplate.update("DELETE FROM visibility_vertex WHERE id IN (1, 2, 3, 4)");
++
+         UUID taskId = UUID.randomUUID();
+ 
+         // Создаём тестовую запись задачи
+diff --git a/src/test/java/ru/dit/heattracer/service/PathFinderServiceTest.java b/src/test/java/ru/dit/heattracer/service/PathFinderServiceTest.java
+index 8a5f4dd..1736a7e 100644
+--- a/src/test/java/ru/dit/heattracer/service/PathFinderServiceTest.java
++++ b/src/test/java/ru/dit/heattracer/service/PathFinderServiceTest.java
+@@ -40,6 +40,14 @@ class PathFinderServiceTest extends BasePostgresIntegrationTest {
+      * @return идентификатор созданной задачи
+      */
+     private UUID seedSimpleGraph() {
++        // Reused Testcontainers: если прошлый прогон упал до cleanup(),
++        // строки с id 101..103 остались в БД. Удаляем их до вставки,
++        // иначе INSERT падает с DuplicateKey на жёстко зашитых id.
++        jdbc.update("DELETE FROM visibility_edge "
++                + "WHERE source_vertex IN (101, 102, 103) "
++                + "   OR target_vertex IN (101, 102, 103)");
++        jdbc.update("DELETE FROM visibility_vertex WHERE id IN (101, 102, 103)");
++
+         UUID taskId = UUID.randomUUID();
+         jdbc.update("INSERT INTO task (id, status) VALUES (?, 'RUNNING')", taskId);
+         jdbc.update("INSERT INTO visibility_vertex (id, task_id, cluster_id, vertex_type, geom) "
+diff --git a/src/test/java/ru/dit/heattracer/service/VisibilityGraphValidationTest.java b/src/test/java/ru/dit/heattracer/service/VisibilityGraphValidationTest.java
+index 95608b8..7f2401e 100644
+--- a/src/test/java/ru/dit/heattracer/service/VisibilityGraphValidationTest.java
++++ b/src/test/java/ru/dit/heattracer/service/VisibilityGraphValidationTest.java
+@@ -7,17 +7,23 @@ import org.springframework.jdbc.core.JdbcTemplate;
+ 
+ import java.util.List;
+ import java.util.Map;
++import java.util.UUID;
+ 
+ import static org.junit.jupiter.api.Assertions.*;
+ 
+ /**
+  * Тесты производительности и валидации графа видимости.
+- * 
++ *
+  * Проверяет:
+  * 1. Количество вершин/рёбер после оптимизации
+  * 2. Время выполнения build_visibility_graph()
+  * 3. Connectivity (все OKS достигают кандидатов)
+  * 4. Длина маршрутов (не должна вырасти >10%)
++ *
++ * <p>ВАЖНО: контейнер Testcontainers переиспользуется между прогонами ({@code withReuse(true)}),
++ * поэтому в БД остаются данные прошлых прогонов. Все счётные проверки скоупятся по
++ * {@link #latestFinishedTaskId()} — последней завершённой задаче (её оставляет HybridConnectivityIT),
++ * иначе запросы вида {@code WHERE task_id IS NOT NULL} суммируют весь мусор прошлых прогонов.
+  */
+ @DisplayName("Валидация графа видимости")
+ class VisibilityGraphValidationTest extends BasePostgresIntegrationTest {
+@@ -25,17 +31,36 @@ class VisibilityGraphValidationTest extends BasePostgresIntegrationTest {
+     @Autowired
+     private JdbcTemplate jdbcTemplate;
+ 
++    /**
++     * Возвращает id самой свежей завершённой задачи — той, что оставил HybridConnectivityIT.
++     * Все счётные тесты в этом классе должны скоупиться по ней, иначе reused-контейнер
++     * подмешивает данные прошлых прогонов.
++     *
++     * @return идентификатор последней задачи с заполненным finished_at
++     */
++    private UUID latestFinishedTaskId() {
++        return jdbcTemplate.queryForObject(
++            "SELECT id FROM task " +
++            "WHERE finished_at IS NOT NULL " +
++            "ORDER BY finished_at DESC " +
++            "LIMIT 1",
++            UUID.class
++        );
++    }
++
+     @Test
+     @DisplayName("build_visibility_graph возвращает разумное количество вершин")
+     void testVisibilityGraphVertexCount() {
+         // После оптимизации p_max_corners=400, должно быть < 600 вершин на кластер
+         // (400 corners + ~50 oks + ~50 candidates максимум)
+-        
++        UUID taskId = latestFinishedTaskId();
++
+         List<Map<String, Object>> results = jdbcTemplate.queryForList(
+             "SELECT cluster_id, COUNT(*) as vertex_count " +
+             "FROM visibility_vertex " +
+-            "WHERE task_id IS NOT NULL " +
+-            "GROUP BY cluster_id"
++            "WHERE task_id = ? " +
++            "GROUP BY cluster_id",
++            taskId
+         );
+ 
+         for (Map<String, Object> row : results) {
+@@ -49,11 +74,14 @@ class VisibilityGraphValidationTest extends BasePostgresIntegrationTest {
+     @Test
+     @DisplayName("Рёбра графа имеют корректные cost/reverse_cost")
+     void testEdgeCosts() {
++        UUID taskId = latestFinishedTaskId();
++
+         List<Map<String, Object>> edges = jdbcTemplate.queryForList(
+             "SELECT id, length_m, cost, reverse_cost, is_special, special_k " +
+             "FROM visibility_edge " +
+-            "WHERE task_id IS NOT NULL " +
+-            "LIMIT 100"
++            "WHERE task_id = ? " +
++            "LIMIT 100",
++            taskId
+         );
+ 
+         for (Map<String, Object> edge : edges) {
+@@ -72,11 +100,14 @@ class VisibilityGraphValidationTest extends BasePostgresIntegrationTest {
+     @Test
+     @DisplayName("Специальные рёбра имеют special_k коэффициент")
+     void testSpecialEdgesHaveCoefficient() {
++        UUID taskId = latestFinishedTaskId();
++
+         List<Map<String, Object>> specialEdges = jdbcTemplate.queryForList(
+             "SELECT id, is_special, special_k, crossings " +
+             "FROM visibility_edge " +
+-            "WHERE task_id IS NOT NULL AND is_special = TRUE " +
+-            "LIMIT 50"
++            "WHERE task_id = ? AND is_special = TRUE " +
++            "LIMIT 50",
++            taskId
+         );
+ 
+         for (Map<String, Object> edge : specialEdges) {
+@@ -92,21 +123,24 @@ class VisibilityGraphValidationTest extends BasePostgresIntegrationTest {
+     @Test
+     @DisplayName("OKS вершины соединены с кандидатами (connectivity check)")
+     void testOksConnectivity() {
++        UUID taskId = latestFinishedTaskId();
++
+         // Проверяем, что у каждой OKS вершины есть исходящие рёбра
+         List<Map<String, Object>> oksVertices = jdbcTemplate.queryForList(
+             "SELECT id, cluster_id FROM visibility_vertex " +
+-            "WHERE vertex_type = 'oks' AND task_id IS NOT NULL " +
+-            "LIMIT 100"
++            "WHERE vertex_type = 'oks' AND task_id = ? " +
++            "LIMIT 100",
++            taskId
+         );
+ 
+         int connectedCount = 0;
+         for (Map<String, Object> oks : oksVertices) {
+             Long oksId = ((Number) oks.get("id")).longValue();
+-            
++
+             List<Long> edges = jdbcTemplate.queryForList(
+                 "SELECT id FROM visibility_edge " +
+-                "WHERE source_vertex = ? AND task_id IS NOT NULL",
+-                Long.class, oksId
++                "WHERE source_vertex = ? AND task_id = ?",
++                Long.class, oksId, taskId
+             );
+ 
+             if (!edges.isEmpty()) {
+@@ -127,13 +161,17 @@ class VisibilityGraphValidationTest extends BasePostgresIntegrationTest {
+     void testPolygonSimplification() {
+         // Проверяем, что corner вершины имеют упрощённую геометрию
+         // (количество corners должно быть значительно меньше чем без упрощения)
+-        
++        UUID taskId = latestFinishedTaskId();
++
++        // polygon_count считаем ТОЛЬКО по polygon_corner: иначе COUNT(DISTINCT ref_id)
++        // по всем строкам включает OKS/candidate/escape_point и занижает среднее.
+         Map<String, Object> stats = jdbcTemplate.queryForMap(
+             "SELECT " +
+             "   COUNT(*) FILTER (WHERE vertex_type = 'polygon_corner') as corner_count, " +
+-            "   COUNT(DISTINCT ref_id) as polygon_count " +
++            "   COUNT(DISTINCT ref_id) FILTER (WHERE vertex_type = 'polygon_corner') as polygon_count " +
+             "FROM visibility_vertex " +
+-            "WHERE task_id IS NOT NULL"
++            "WHERE task_id = ?",
++            taskId
+         );
+ 
+         Number cornerCount = (Number) stats.get("corner_count");
+-- 
+2.39.5
+

@@ -1,0 +1,8 @@
+/workspace/src/test/java/ru/dit/heattracer/service/VisibilityGraphValidationTest.java
+/workspace/src/test/java/ru/dit/heattracer/service/DockerApiProbeTest.java
+/workspace/src/test/java/ru/dit/heattracer/service/HybridVisibilityGraphServiceTest.java
+/workspace/src/test/java/ru/dit/heattracer/service/RestrictionRulesValidationTest.java
+/workspace/src/test/java/ru/dit/heattracer/service/PathFinderServiceTest.java
+/workspace/src/test/java/ru/dit/heattracer/service/FastVisibilityGraphServiceTest.java
+/workspace/src/test/java/ru/dit/heattracer/service/HybridConnectivityIT.java
+/workspace/src/test/java/ru/dit/heattracer/service/BasePostgresIntegrationTest.java
