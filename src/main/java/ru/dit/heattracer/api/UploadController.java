@@ -1,5 +1,6 @@
 package ru.dit.heattracer.api;
 
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
@@ -17,6 +18,7 @@ public class UploadController {
 
     private final TaskService taskService;
 
+    @Autowired
     public UploadController(TaskService taskService) {
         this.taskService = taskService;
     }

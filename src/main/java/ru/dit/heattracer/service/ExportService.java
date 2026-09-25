@@ -3,6 +3,7 @@ package ru.dit.heattracer.service;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 import ru.dit.heattracer.io.GeoJsonStreamWriter;
@@ -21,6 +22,7 @@ public class ExportService {
     private final GeoJsonStreamWriter writer;
     private final ObjectMapper mapper = new ObjectMapper();
 
+    @Autowired
     public ExportService(JdbcTemplate jdbc, GeoJsonStreamWriter writer) {
         this.jdbc = jdbc;
         this.writer = writer;
