@@ -65,7 +65,7 @@ public class RouteBuilderService {
         long start = System.currentTimeMillis();
 
         // 1. Читаем все пути
-        List<PathRow> paths = readPaths(taskId);
+        List<PathRow> paths = readPaths(taskId, variantId);
         if (paths.isEmpty()) {
             log.warn("[{}] Нет path_result — строить маршрут нечего", taskId);
             writeEmptySummary(taskId, variantId);
@@ -184,10 +184,10 @@ public class RouteBuilderService {
 
     // ===== Чтение из БД =====
 
-    private List<PathRow> readPaths(UUID taskId) {
+    private List<PathRow> readPaths(UUID taskId, String variantId) {
         return jdbc.query(
                 "SELECT cluster_id, oks_vertex_id, target_vertex_id, edge_ids, total_length_m " +
-                        "FROM path_result WHERE task_id = ? ORDER BY oks_vertex_id",
+                    "FROM path_result WHERE task_id = ? AND variant_id = ? ORDER BY oks_vertex_id",
                 (rs, i) -> {
                     PathRow p = new PathRow();
                     p.clusterId = rs.getInt("cluster_id");
@@ -204,7 +204,7 @@ public class RouteBuilderService {
                     }
                     p.edgeIds = ids;
                     return p;
-                }, taskId);
+                }, taskId, variantId);
     }
 
     private Map<Long, Double> readOksFlow(UUID taskId) {

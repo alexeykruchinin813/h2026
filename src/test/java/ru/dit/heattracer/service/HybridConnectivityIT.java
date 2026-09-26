@@ -7,6 +7,8 @@ import org.springframework.core.io.ClassPathResource;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.mock.web.MockMultipartFile;
 
+import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -144,5 +146,28 @@ class HybridConnectivityIT extends BasePostgresIntegrationTest {
                 String.format("Недостаточно OKS с путём: только %d из %d (минимум %d). " +
                                 "Проверь create_escape_points (V41) и find_best_path_from_oks (V21).",
                         oksWithPath, totalOksCount, minWithPath));
+
+        // ===== P2.2: три содержательно отличающихся варианта =====
+        List<Map<String, Object>> variants = jdbcTemplate.queryForList(
+                "SELECT id, rank, score, construction_cost, new_network_length " +
+                        "FROM variant WHERE task_id = ? ORDER BY rank",
+                taskId);
+
+        System.out.printf("[P2-2 METRIC] Вариантов: %d%n", variants.size());
+        for (Map<String, Object> v : variants) {
+            System.out.printf("          %s rank=%s score=%s cost=%s length=%s%n",
+                    v.get("id"), v.get("rank"), v.get("score"),
+                    v.get("construction_cost"), v.get("new_network_length"));
+        }
+
+        assertEquals(3, variants.size(), "ТЗ 2.8: должно быть 3 варианта");
+        assertEquals(1, ((Number) variants.get(0).get("rank")).intValue(),
+                "rank 1 должен быть у минимального score");
+        assertTrue(((Number) variants.get(0).get("score")).doubleValue()
+                        <= ((Number) variants.get(1).get("score")).doubleValue(),
+                "rank 1 должен иметь score <= rank 2");
+        assertTrue(((Number) variants.get(1).get("score")).doubleValue()
+                        <= ((Number) variants.get(2).get("score")).doubleValue(),
+                "rank 2 должен иметь score <= rank 3");
     }
 }
