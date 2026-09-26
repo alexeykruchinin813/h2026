@@ -110,7 +110,7 @@ public class RouteBuilderService {
         double totalSegmentCost = 0.0;
         double totalLength = 0.0;
         for (EdgeRow e : edges.values()) {
-            e.cost = e.lengthM * e.spec.getCostPerM();
+            e.cost = e.lengthM * e.spec.getCostPerM() * e.specialK;
             totalSegmentCost += e.cost;
             totalLength += e.lengthM;
         }
@@ -166,10 +166,13 @@ public class RouteBuilderService {
                 constructionCost, chamberCost, existingTieInCount, tieInCost,
                 0.0, constructionCost, totalLength, score, new ArrayList<>());
 
-        log.info("[{}] RouteBuilder done in {} ms: edges={}, chambers={}, tieIn={}, len={} m, " +
-                        "segmentCost={}, chamberCost={}, tieInCost={}, score={}",
+        int specialEdges = 0;
+        for (EdgeRow e : edges.values()) if (e.isSpecial) specialEdges++;
+
+        log.info("[{}] RouteBuilder done in {} ms: edges={} ({} special), chambers={}, tieIn={}, " +
+                        "len={} m, segmentCost={}, chamberCost={}, tieInCost={}, score={}",
                 taskId, System.currentTimeMillis() - start,
-                edges.size(), newChamberCount, existingTieInCount,
+                edges.size(), specialEdges, newChamberCount, existingTieInCount,
                 String.format("%.1f", totalLength),
                 String.format("%.0f", totalSegmentCost),
                 String.format("%.0f", chamberCost),
@@ -229,6 +232,7 @@ public class RouteBuilderService {
         Long[] arr = edgeIds.toArray(new Long[0]);
         jdbc.query(
                 "SELECT ve.id, ve.source_vertex, ve.target_vertex, ve.length_m, " +
+                        "       ve.is_special, ve.special_k, " +
                         "       ST_AsText(ve.geom) AS wkt " +
                         "FROM visibility_edge ve " +
                         "WHERE ve.task_id = ? AND ve.id = ANY (?)",
@@ -243,6 +247,9 @@ public class RouteBuilderService {
                     e.targetVertex = rs.getLong("target_vertex");
                     e.lengthM = rs.getDouble("length_m");
                     e.wkt = rs.getString("wkt");
+                    e.isSpecial = rs.getBoolean("is_special");
+                    double k = rs.getDouble("special_k");
+                    e.specialK = rs.wasNull() ? 1.0 : k;
                     result.put(e.id, e);
                 });
         return result;
@@ -361,10 +368,14 @@ public class RouteBuilderService {
                 props.put("flow_tph",      round2(e.flow));
                 props.put("diameter",      e.spec.getDiameter());
                 props.put("length",        round2(e.lengthM));
-                props.put("laying_method", "base");
+                props.put("laying_method", e.isSpecial ? "special" : "base");
                 props.put("depth_start",   null);
                 props.put("depth_end",     null);
                 props.put("cost",          round2(e.cost));
+
+                if (e.isSpecial) {
+                    props.put("special_k", e.specialK);
+                }
 
                 String json = mapper.writeValueAsString(props);
                 jdbc.update(
@@ -489,6 +500,8 @@ public class RouteBuilderService {
         double flow;
         DiameterSpec spec;
         double cost;
+        boolean isSpecial;
+        double specialK;
     }
 
     static class TargetInfo {
