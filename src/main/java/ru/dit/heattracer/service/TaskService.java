@@ -387,9 +387,9 @@ public class TaskService {
             state.setPercent(95);
 
             Path resultPath = state.getInputPath().getParent().resolve("result.geojson");
-            long written = exportService.exportVariantFeatures(id, "v1", resultPath);
+            long written = exportService.exportAllVariants(id, resultPath);
 
-            log.info("[{}] Result written: {} features to {}", id, written, resultPath);
+            log.info("[{}] Result written: {} features (all variants) to {}", id, written, resultPath);
             state.setResultPath(resultPath);
 
             // ===== 10. ЗАВЕРШЕНИЕ =====

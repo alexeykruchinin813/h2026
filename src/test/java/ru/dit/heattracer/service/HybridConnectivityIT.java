@@ -130,22 +130,31 @@ class HybridConnectivityIT extends BasePostgresIntegrationTest {
                                 "Цель P0: >= %d. Требуется tuning гибридного валидатора или escape points.",
                         connectedOksCount, totalOksCount, targetConnected));
 
-        // ===== P1-1: пути A* (V42) =====
-        Integer oksWithPath = jdbcTemplate.queryForObject(
-                "SELECT COUNT(*) FROM path_result WHERE task_id = ?",
-                Integer.class, taskId);
+        // P1-1: пути A* по вариантам (V43: три варианта × N OKS)
+        List<Map<String, Object>> perVariant = jdbcTemplate.queryForList(
+                "SELECT variant_id, COUNT(DISTINCT oks_vertex_id) AS cnt " +
+                        "FROM path_result WHERE task_id = ? " +
+                        "GROUP BY variant_id ORDER BY variant_id",
+                taskId);
 
-        assertNotNull(oksWithPath, "Запрос path_result не должен возвращать null");
+        System.out.println("[P1-1 METRIC] OKS с найденным путём по вариантам:");
+        for (Map<String, Object> r : perVariant) {
+            System.out.printf("          %s : %s из %d%n",
+                    r.get("variant_id"), r.get("cnt"), totalOksCount);
+        }
 
-        System.out.printf("[P1-1 METRIC] ОКС с найденным путём в path_result: %d из %d%n",
-                oksWithPath, totalOksCount);
+        // Минимум по всем вариантам — консервативный регрессионный барьер
+        int minWithPath = Integer.MAX_VALUE;
+        for (Map<String, Object> r : perVariant) {
+            minWithPath = Math.min(minWithPath, ((Number) r.get("cnt")).intValue());
+        }
+        if (perVariant.isEmpty()) minWithPath = 0;
 
-        // Регрессионный барьер: после V41 факт = 17/17; допускаем 1 не найденный на всякий случай.
-        int minWithPath = Math.min(16, totalOksCount);
-        assertTrue(oksWithPath >= minWithPath,
-                String.format("Недостаточно OKS с путём: только %d из %d (минимум %d). " +
-                                "Проверь create_escape_points (V41) и find_best_path_from_oks (V21).",
-                        oksWithPath, totalOksCount, minWithPath));
+        int expectedMin = Math.min(16, totalOksCount);
+        assertTrue(minWithPath >= expectedMin,
+                String.format("Недостаточно OKS с путём (мин по вариантам): %d из %d (ожидали ≥ %d). " +
+                                "Проверь create_escape_points (V41) и findPathsFromOks (V21).",
+                        minWithPath, totalOksCount, expectedMin));
 
         // ===== P2.2: три содержательно отличающихся варианта =====
         List<Map<String, Object>> variants = jdbcTemplate.queryForList(

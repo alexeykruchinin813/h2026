@@ -98,4 +98,43 @@ public class ExportService {
                 )
         );
     }
+
+    /**
+     * P2.2: экспортирует ВСЕ варианты задачи в один GeoJSON.
+     * По ТЗ 7.1: варианты различаются через properties.variant_id.
+     */
+    public long exportAllVariants(UUID taskId, Path output) throws IOException {
+        return writer.writeCollection(output, emitter ->
+                jdbc.query(
+                        "SELECT feature_id, variant_id, object_type, properties, " +
+                                "       ST_AsGeoJSON(geom_4326) AS geom_json " +
+                                "FROM variant_feature " +
+                                "WHERE task_id = ? " +
+                                "ORDER BY variant_id, id",
+                        rs -> {
+                            try {
+                                String rawGeom = rs.getString("geom_json");
+                                String propsJson = rs.getString("properties");
+                                @SuppressWarnings("unchecked")
+                                Map<String, Object> props = mapper.readValue(propsJson, Map.class);
+
+                                props.put("object_type", rs.getString("object_type"));
+                                String featureId = rs.getString("feature_id");
+                                if (featureId != null) {
+                                    props.put("id", featureId);
+                                }
+                                // variant_id уже в properties (пишет RouteBuilderService),
+                                // но на всякий случай дублируем из колонки:
+                                props.put("variant_id", rs.getString("variant_id"));
+
+                                emitter.featureRawGeometry(rawGeom, props);
+                            } catch (IOException e) {
+                                throw new RuntimeException(e);
+                            }
+                        },
+                        taskId
+                )
+        );
+    }
+
 }
