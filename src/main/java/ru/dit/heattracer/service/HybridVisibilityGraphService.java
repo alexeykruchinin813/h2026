@@ -472,11 +472,14 @@ public class HybridVisibilityGraphService {
     }
 
     /**
-     * Определяет буфер OKS по диаметру трубы (ТЗ п. 3.2)
+     * Отступ OKS по ДУ, ТЗ таблица 2:
+     *   < 500 мм → 5,0 м
+     *   500–800 мм → 7,0 м
+     *   ≥ 900 мм → 9,0 м
      */
     private double getOksBufferByDiameter(int diameterMm) {
-        if (diameterMm <= 100) return 5.0;
-        if (diameterMm <= 200) return 7.0;
+        if (diameterMm < 500)  return 5.0;
+        if (diameterMm <= 800) return 7.0;
         return 9.0;
     }
 

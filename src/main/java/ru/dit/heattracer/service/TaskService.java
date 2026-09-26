@@ -380,6 +380,16 @@ public class TaskService {
                             ") sub WHERE v.task_id = ? AND v.id = sub.id",
                     id, id);
 
+            // P0-фикс: перезаписываем rank в properties у variant_summary,
+            // чтобы экспорт содержал реальный rank, а не хардкод 1.
+            jdbcTemplate.update(
+                    "UPDATE variant_feature vf SET properties = " +
+                            "  jsonb_set(vf.properties, '{rank}', to_jsonb(v.rank)) " +
+                            "FROM variant v " +
+                            "WHERE vf.task_id = ? AND vf.task_id = v.task_id " +
+                            "  AND vf.variant_id = v.id AND vf.object_type = 'variant_summary'",
+                    id);
+
             log.info("[{}] Variants built and ranked: {}", id, variantIds);
 
             // ===== 9. ЭКСПОРТ РЕЗУЛЬТАТА (только v1) =====
