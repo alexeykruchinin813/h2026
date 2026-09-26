@@ -46,6 +46,13 @@ public class ExportService {
                                 String propsJson = rs.getString("properties");
                                 @SuppressWarnings("unchecked")
                                 Map<String, Object> props = mapper.readValue(propsJson, Map.class);
+
+                                props.put("object_type", rs.getString("object_type"));
+                                String featureId = rs.getString("feature_id");
+                                if (featureId != null) {
+                                    props.put("id", featureId);
+                                }
+
                                 emitter.featureRawGeometry(rawGeom, props);
                             } catch (IOException e) {
                                 throw new RuntimeException(e);
@@ -63,7 +70,7 @@ public class ExportService {
     public long exportVariantFeatures(UUID taskId, String variantId, Path output) throws IOException {
         return writer.writeCollection(output, emitter ->
                 jdbc.query(
-                        "SELECT object_type, properties, " +
+                        "SELECT feature_id, object_type, properties, " +
                                 "       ST_AsGeoJSON(geom_4326) AS geom_json " +
                                 "FROM variant_feature " +
                                 "WHERE task_id = ? AND variant_id = ? " +
@@ -74,6 +81,14 @@ public class ExportService {
                                 String propsJson = rs.getString("properties");
                                 @SuppressWarnings("unchecked")
                                 Map<String, Object> props = mapper.readValue(propsJson, Map.class);
+
+                                // P1.3: id и object_type по разделу 7.2 ТЗ
+                                props.put("object_type", rs.getString("object_type"));
+                                String featureId = rs.getString("feature_id");
+                                if (featureId != null) {
+                                    props.put("id", featureId);
+                                }
+
                                 emitter.featureRawGeometry(rawGeom, props);
                             } catch (IOException e) {
                                 throw new RuntimeException(e);

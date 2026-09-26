@@ -120,9 +120,16 @@ public class RouteBuilderService {
         Set<Long> targetVertices = new LinkedHashSet<>();
         for (PathRow p : paths) targetVertices.add(p.targetVertexId);
 
+        // Камера строится в target-точке ПУТИ (не ребра).
+        // ДУ камеры = максимум ДУ последнего ребра каждого пути,
+        // приходящего в эту точку (несколько OKS могут делить одну врезку).
         Map<Long, DiameterSpec> chamberSpec = new HashMap<>();
-        for (EdgeRow e : edges.values()) {
-            chamberSpec.merge(e.targetVertex, e.spec,
+        for (PathRow p : paths) {
+            if (p.edgeIds.isEmpty()) continue;
+            Long lastEdgeId = p.edgeIds.get(p.edgeIds.size() - 1);
+            EdgeRow e = edges.get(lastEdgeId);
+            if (e == null) continue;
+            chamberSpec.merge(p.targetVertexId, e.spec,
                     (a, b) -> a.getDiameter() >= b.getDiameter() ? a : b);
         }
 
@@ -377,6 +384,14 @@ public class RouteBuilderService {
                                Map<Long, TargetInfo> targetInfo) {
         for (Map.Entry<Long, DiameterSpec> entry : chamberSpec.entrySet()) {
             Long tv = entry.getKey();
+            TargetInfo info = targetInfo.get(tv);
+
+            // Существующая врезка: heat_chamber не создаём, учитываем только в summary
+            boolean existing = info != null && "heat_chamber".equals(info.existingType);
+            if (existing) {
+                continue;
+            }
+
             int diam = entry.getValue().getDiameter();
             long cost = chamberCostByDiameter(diam);
 
@@ -385,10 +400,6 @@ public class RouteBuilderService {
                 props.put("variant_id", variantId);
                 props.put("diameter",   diam);
                 props.put("cost",       round2(cost));
-                TargetInfo info = targetInfo.get(tv);
-                if (info != null) {
-                    props.put("existing_object_id", info.refId);
-                }
 
                 String json = mapper.writeValueAsString(props);
                 jdbc.update(
