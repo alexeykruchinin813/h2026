@@ -222,17 +222,31 @@ mvn clean test          # полный прогон (Docker Desktop должен
 mvn clean test -Dtest=HybridConnectivityIT   # только интеграционный
 ```
 
-Все 34 теста должны быть зелёными: 31 pass + 3 skip (DockerApiProbeTest —
-диагностический, EscapePointsDiagnosticsIT — diagnostic, требует свежей задачи).
+### 6.3. Загрузка набора через REST API
 
-### 6.3. Загрузка набора
+Сервис предоставляет HTTP-API (Swagger UI: `http://localhost:8080/swagger-ui.html`).
+
+**Загрузить набор:**
 
 ```bash
-curl -X POST -F "file=@first_dataset.geojson" http://localhost:8080/api/tasks
+curl -X POST -F "file=@first_dataset.geojson" http://localhost:8080/api/upload
 ```
 
-Через `TaskService.submit` набор обрабатывается асинхронно, результат
-кладётся в `result.geojson` в директории задачи.
+Ответ:
+```json
+{"taskId":"...","status":"RUNNING"}
+```
+
+**Проверить статус (polling):**
+
+```bash
+curl http://localhost:8080/api/task/<taskId>
+```
+
+Ответ:
+```json
+{"taskId":"...","status":"DONE","stage":"DONE","percent":100,"errorMessage":null}
+```
 
 ## 7. Границы применения решения
 

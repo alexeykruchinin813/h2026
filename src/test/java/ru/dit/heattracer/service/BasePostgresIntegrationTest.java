@@ -27,7 +27,7 @@ import org.testcontainers.utility.DockerImageName;
  */
 @SpringBootTest
 @Testcontainers(disabledWithoutDocker = true)
-abstract class BasePostgresIntegrationTest {
+public abstract class BasePostgresIntegrationTest {
 
     /** Образ PostgreSQL 16 + PostGIS 3.6 + pgRouting 4.0 (соответствует ТЗ: PostgreSQL 14+, PostGIS 3.x, pgRouting). */
     private static final String POSTGRES_IMAGE = "nickblah/pgrouting:16-postgis-3.6-pgrouting-4.0.1";
