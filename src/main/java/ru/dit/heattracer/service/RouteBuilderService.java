@@ -57,6 +57,35 @@ public class RouteBuilderService {
     }
 
     /**
+     * P3.1 (ТЗ 2.9, 6): OKS, для которых в данном варианте нет пути.
+     * Штраф = 100_000_000 + 500_000 × flow_tph (ТЗ 6).
+     */
+    private UnconnectedInfo computeUnconnected(UUID taskId, String variantId) {
+        List<Map<String, Object>> rows = jdbc.queryForList(
+                "SELECT vv.ref_id AS oks_id, " +
+                        "       (f.properties->>'flow_tph')::double precision AS flow " +
+                        "FROM visibility_vertex vv " +
+                        "JOIN input_feature f " +
+                        "  ON f.task_id = vv.task_id AND f.feature_id::text = vv.ref_id " +
+                        "WHERE vv.task_id = ? AND vv.vertex_type = 'oks' " +
+                        "  AND f.object_type = 'oks_connection_point' " +
+                        "  AND NOT EXISTS ( " +
+                        "    SELECT 1 FROM path_result pr " +
+                        "    WHERE pr.task_id = vv.task_id " +
+                        "      AND pr.variant_id = ? " +
+                        "      AND pr.oks_vertex_id = vv.id )",
+                taskId, variantId);
+
+        UnconnectedInfo info = new UnconnectedInfo();
+        for (Map<String, Object> r : rows) {
+            info.ids.add(String.valueOf(r.get("oks_id")));
+            double flow = ((Number) r.get("flow")).doubleValue();
+            info.penalty += 100_000_000.0 + 500_000.0 * flow;
+        }
+        return info;
+    }
+
+    /**
      * Полный пайплайн: считает маршрут и пишет variant_feature для данного variantId.
      *
      * @return variantId (тот же, что передан)
@@ -153,26 +182,37 @@ public class RouteBuilderService {
             }
         }
 
-        // 10. Записываем edges и chambers в variant_feature
+        // 10. Записываем edges, chambers и technical_nodes в variant_feature
         writeEdges(taskId, variantId, edges);
         writeChambers(taskId, variantId, chamberSpec, targetInfo);
+        int technicalNodeCount = writeTechnicalNodes(taskId, variantId, edges);
 
-        // 11. Сводка
+        // 11. Сводка с учётом неподключённых OKS (P3.1, ТЗ 2.9 и 6)
         double constructionCost = totalSegmentCost + chamberCost + tieInCost;
-        double score = SCORE_W_COST * (constructionCost / SCORE_COST_SCALE)
+
+        UnconnectedInfo unconn = computeUnconnected(taskId, variantId);
+        double calculatedCost = constructionCost + unconn.penalty;
+        double score = SCORE_W_COST * (calculatedCost / SCORE_COST_SCALE)
                 + SCORE_W_LENGTH * (totalLength / SCORE_LENGTH_SCALE);
+
+        if (!unconn.ids.isEmpty()) {
+            log.warn("[{}][{}] Не подключено OKS: {} (штраф {} ₽)",
+                    taskId, variantId, unconn.ids.size(),
+                    String.format("%.0f", unconn.penalty));
+        }
 
         writeSummary(taskId, variantId,
                 constructionCost, chamberCost, existingTieInCount, tieInCost,
-                0.0, constructionCost, totalLength, score, new ArrayList<>());
+                unconn.penalty, calculatedCost, totalLength, score, unconn.ids);
 
         int specialEdges = 0;
         for (EdgeRow e : edges.values()) if (e.isSpecial) specialEdges++;
 
         log.info("[{}] RouteBuilder done in {} ms: edges={} ({} special), chambers={}, tieIn={}, " +
-                        "len={} m, segmentCost={}, chamberCost={}, tieInCost={}, score={}",
+                        "technicalNodes={}, len={} m, segmentCost={}, chamberCost={}, tieInCost={}, score={}",
                 taskId, System.currentTimeMillis() - start,
                 edges.size(), specialEdges, newChamberCount, existingTieInCount,
+                technicalNodeCount,
                 String.format("%.1f", totalLength),
                 String.format("%.0f", totalSegmentCost),
                 String.format("%.0f", chamberCost),
@@ -426,6 +466,91 @@ public class RouteBuilderService {
         }
     }
 
+    /**
+     * P3.2 (ТЗ 7.1): создаёт technical_node в узлах смены ДУ или laying_method
+     * между двумя последовательными рёбрами одного варианта.
+     *
+     * Узел становится technical_node, если:
+     *   - через него проходит РОВНО 2 ребра;
+     *   - эти рёбра отличаются diameter ИЛИ is_special;
+     *   - узел не является OKS и не является target (там heat_chamber).
+     *
+     * Узлы с 3+ рёбрами — разветвления, по ТЗ 7.1 выполняются только в камерах.
+     *
+     * @return количество созданных technical_node
+     */
+    private int writeTechnicalNodes(UUID taskId, String variantId, Map<Long, EdgeRow> edges) {
+        // 1. Degree-карта: node_id → список edge_id, примыкающих к узлу
+        Map<Long, List<Long>> nodeEdges = new HashMap<>();
+        for (EdgeRow e : edges.values()) {
+            nodeEdges.computeIfAbsent(e.sourceVertex, k -> new ArrayList<>()).add(e.id);
+            nodeEdges.computeIfAbsent(e.targetVertex, k -> new ArrayList<>()).add(e.id);
+        }
+
+        // 2. Запрещённые узлы: OKS, target (heat_chamber)
+        Set<Long> forbidden = new HashSet<>();
+        jdbc.query(
+                "SELECT id FROM visibility_vertex " +
+                        "WHERE task_id = ? AND vertex_type IN ('oks', 'candidate')",
+                rs -> { forbidden.add(rs.getLong("id")); },
+                taskId);
+        jdbc.query(
+                "SELECT DISTINCT target_vertex_id FROM path_result " +
+                        "WHERE task_id = ? AND variant_id = ?",
+                rs -> { forbidden.add(rs.getLong("target_vertex_id")); },
+                taskId, variantId);
+
+        // 3. Ищем узлы с degree==2 и сменой параметров
+        int written = 0;
+        for (Map.Entry<Long, List<Long>> entry : nodeEdges.entrySet()) {
+            Long nodeId = entry.getKey();
+            List<Long> eids = entry.getValue();
+            if (eids.size() != 2) continue;
+            if (forbidden.contains(nodeId)) continue;
+
+            EdgeRow e1 = edges.get(eids.get(0));
+            EdgeRow e2 = edges.get(eids.get(1));
+            if (e1 == null || e2 == null) continue;
+
+            boolean diamChanged = e1.spec.getDiameter() != e2.spec.getDiameter();
+            boolean layChanged  = e1.isSpecial != e2.isSpecial;
+            if (!diamChanged && !layChanged) continue;
+
+            try {
+                Map<String, Object> props = new LinkedHashMap<>();
+                props.put("variant_id", variantId);
+                if (diamChanged) {
+                    props.put("diameter_from", e1.spec.getDiameter());
+                    props.put("diameter_to",   e2.spec.getDiameter());
+                }
+                if (layChanged) {
+                    props.put("laying_from", e1.isSpecial ? "special" : "base");
+                    props.put("laying_to",   e2.isSpecial ? "special" : "base");
+                }
+                String json = mapper.writeValueAsString(props);
+
+                jdbc.update(
+                        "INSERT INTO technical_node (task_id, variant_id, geom) " +
+                                "SELECT ?, ?, vv.geom FROM visibility_vertex vv WHERE vv.id = ?",
+                        taskId, variantId, nodeId);
+
+                jdbc.update(
+                        "INSERT INTO variant_feature " +
+                                "  (task_id, variant_id, feature_id, object_type, properties, geom_utm, geom_4326) " +
+                                "SELECT ?, ?, ?, 'technical_node', ?::jsonb, vv.geom, " +
+                                "       ST_Transform(vv.geom, 4326) " +
+                                "FROM visibility_vertex vv WHERE vv.id = ?",
+                        taskId, variantId, "tn_" + variantId + "_" + nodeId, json, nodeId);
+
+                written++;
+            } catch (Exception ex) {
+                log.error("[{}][{}] writeTechnicalNode node={} failed: {}",
+                        taskId, variantId, nodeId, ex.getMessage());
+            }
+        }
+        return written;
+    }
+
     private void writeSummary(UUID taskId, String variantId,
                               double constructionCost, double chamberCost,
                               int existingTieInCount, double tieInCost,
@@ -475,13 +600,22 @@ public class RouteBuilderService {
     }
 
     private void writeEmptySummary(UUID taskId, String variantId) {
-        writeSummary(taskId, variantId, 0, 0, 0, 0, 0, 0, 0, 0, new ArrayList<>());
+        UnconnectedInfo unconn = computeUnconnected(taskId, variantId);
+        double calculatedCost = unconn.penalty;
+        double score = SCORE_W_COST * (calculatedCost / SCORE_COST_SCALE);
+        writeSummary(taskId, variantId,
+                0, 0, 0, 0, unconn.penalty, calculatedCost, 0, score, unconn.ids);
     }
 
     private static double round2(double v) { return Math.round(v * 100.0) / 100.0; }
     private static double round4(double v) { return Math.round(v * 10000.0) / 10000.0; }
 
     // ===== Внутренние структуры =====
+
+    static class UnconnectedInfo {
+        final List<String> ids = new ArrayList<>();
+        double penalty = 0.0;
+    }
 
     static class PathRow {
         int clusterId;
