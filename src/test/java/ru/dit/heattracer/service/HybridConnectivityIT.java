@@ -13,17 +13,24 @@ import static org.junit.jupiter.api.Assertions.*;
 
 /**
  * Интеграционный тест связности гибридного графа на конкурсном наборе данных (P0-4).
- * Запускает полный production-пайплайн через {@link TaskService#submit}, дожидается завершения
- * и проверяет метрику связности: количество ОКС, имеющих хотя бы одно ребро
- * к "чужим" вершинам (escape, candidate или чужие polygon_corner).
- * Цель P0: >= 10 из 17 ОКС.
+ * Запускает полный production-пайплайн через {@link TaskService#submit}, дожидается
+ * завершения и проверяет метрику связности: количество ОКС, имеющих хотя бы одно ребро
+ * к "чужим" вершинам.
+ *
+ * <p>V46: дополнительно проверяет инварианты физической топологии новой сети:
+ * <ul>
+ *   <li>0 пересечений сегментов вне общих узлов (ТЗ 2.1);</li>
+ *   <li>degree ≤ 4 во всех физических узлах (ТЗ 2.3);</li>
+ *   <li>агрегация flow на общем участке (ТЗ 2.3);</li>
+ *   <li>ДУ проставлен по агрегированному flow (таблица 1 ТЗ).</li>
+ * </ul>
  */
 @DisplayName("Интеграционный тест связности гибридного графа (P0-4)")
 class HybridConnectivityIT extends BasePostgresIntegrationTest {
 
     private static final int P0_TARGET_CONNECTED = 16;
     private static final String TEST_DATASET_RESOURCE = "first_dataset.geojson";
-    private static final long TIMEOUT_MS = 180_000; // 5 минут: escape-этап ~75с/кластер до оптимизации V33
+    private static final long TIMEOUT_MS = 180_000; // 3 минуты: escape-этап + физическая топология
     private static final long POLL_INTERVAL_MS = 1_000;
 
     @Autowired
@@ -33,7 +40,7 @@ class HybridConnectivityIT extends BasePostgresIntegrationTest {
     private JdbcTemplate jdbcTemplate;
 
     @Test
-    @DisplayName("Полный пайплайн: связность ОКС на конкурсном наборе (цель P0: >= 10)")
+    @DisplayName("Полный пайплайн: связность ОКС и физическая топология (V46)")
     void testOksConnectivityOnFirstDataset() throws Exception {
         // 1. Загрузка тестового датасета (эмулируем загрузку через REST API)
         ClassPathResource resource = new ClassPathResource(TEST_DATASET_RESOURCE);
@@ -45,7 +52,6 @@ class HybridConnectivityIT extends BasePostgresIntegrationTest {
         assertNotNull(taskId, "submit() должен вернуть UUID задачи");
 
         // 3. Ожидание завершения задачи (polling).
-        // Используем var, чтобы не зависеть от модификаторов доступа класса TaskState и его Enum.
         long startTime = System.currentTimeMillis();
         boolean isDone = false;
         boolean isFailed = false;
@@ -74,7 +80,7 @@ class HybridConnectivityIT extends BasePostgresIntegrationTest {
         assertTrue(isDone,
                 "Задача должна завершиться успешно. Ошибка пайплайна: " + errorMessage);
 
-        // 4. Инвариант P0-3b: SRID графа должен быть 32637 (метры), а не 4326 (градусы)
+        // 4. Инвариант P0-3b: SRID графа = 32637 (метры), а не 4326 (градусы)
         Integer srid = jdbcTemplate.queryForObject(
                 "SELECT Find_SRID('public', 'visibility_vertex', 'geom')", Integer.class);
         assertNotNull(srid, "SRID геометрии вершин не должен быть null");
@@ -93,8 +99,7 @@ class HybridConnectivityIT extends BasePostgresIntegrationTest {
         assertNotNull(totalEdges, "Количество рёбер не должно быть null");
         assertTrue(totalEdges > 0, "Гибридный граф должен содержать рёбра после построения");
 
-        // 6. Подсчёт ОКС, имеющих выход к чужим вершинам
-        // Чужая вершина: либо не oks, либо oks с другим own_polygon_id (согласно схеме V14)
+        // 6. Подсчёт ОКС, имеющих выход к чужим вершинам.
         Integer connectedOksCount = jdbcTemplate.queryForObject(
                 "SELECT COUNT(DISTINCT v1.id) " +
                         "FROM visibility_vertex v1 " +
@@ -111,22 +116,18 @@ class HybridConnectivityIT extends BasePostgresIntegrationTest {
         System.out.printf("[P0-4 METRIC] Связность ОКС: %d из %d имеют рёбра к чужим вершинам. Всего рёбер: %d%n",
                 connectedOksCount, totalOksCount, totalEdges);
 
-        // WARN, но не FAIL: полная связность (17/17) — текущий факт, любой откат от неё фиксируем.
         if (connectedOksCount < totalOksCount) {
-            System.out.printf("[P0-4 WARN] %d ОКС без рёбер к чужим вершинам — регресс от V34 (17/17). " +
-                            "Проверь escape_points и валидатор мостов.%n",
+            System.out.printf("[P0-4 WARN] %d ОКС без рёбер к чужим вершинам.%n",
                     totalOksCount - connectedOksCount);
         }
 
-        // 7. Проверка метрики P0
         int targetConnected = Math.min(P0_TARGET_CONNECTED, totalOksCount);
-
         assertTrue(connectedOksCount >= targetConnected,
-                String.format("Недостаточная связность графа: только %d из %d ОКС имеют рёбра к чужим вершинам. " +
-                                "Цель P0: >= %d. Требуется tuning гибридного валидатора или escape points.",
+                String.format("Недостаточная связность графа: только %d из %d ОКС имеют рёбра " +
+                                "к чужим вершинам. Цель P0: >= %d.",
                         connectedOksCount, totalOksCount, targetConnected));
 
-        // P1-1: пути A* по вариантам (V43: три варианта × N OKS)
+        // 7. P1-1: пути A* по вариантам (V43: три варианта × N OKS)
         List<Map<String, Object>> perVariant = jdbcTemplate.queryForList(
                 "SELECT variant_id, COUNT(DISTINCT oks_vertex_id) AS cnt " +
                         "FROM path_result WHERE task_id = ? " +
@@ -139,7 +140,6 @@ class HybridConnectivityIT extends BasePostgresIntegrationTest {
                     r.get("variant_id"), r.get("cnt"), totalOksCount);
         }
 
-        // Минимум по всем вариантам — консервативный регрессионный барьер
         int minWithPath = Integer.MAX_VALUE;
         for (Map<String, Object> r : perVariant) {
             minWithPath = Math.min(minWithPath, ((Number) r.get("cnt")).intValue());
@@ -148,15 +148,14 @@ class HybridConnectivityIT extends BasePostgresIntegrationTest {
 
         int expectedMin = Math.min(16, totalOksCount);
         assertTrue(minWithPath >= expectedMin,
-                String.format("Недостаточно OKS с путём (мин по вариантам): %d из %d (ожидали ≥ %d). " +
-                                "Проверь create_escape_points (V41) и findPathsFromOks (V21).",
+                String.format("Недостаточно OKS с путём (мин по вариантам): %d из %d (ожидали ≥ %d).",
                         minWithPath, totalOksCount, expectedMin));
 
-        // ===== P2.2: три содержательно отличающихся варианта =====
+        // ===== P2.2: до трёх содержательно отличающихся вариантов =====
         List<Map<String, Object>> variants = jdbcTemplate.queryForList(
-            "SELECT id, rank, score, construction_cost, new_network_length, " +
-                "       unconnected_penalty, unconnected_oks_ids " +
-                "FROM variant WHERE task_id = ? ORDER BY rank",
+                "SELECT id, rank, score, construction_cost, new_network_length, " +
+                        "       unconnected_penalty, unconnected_oks_ids " +
+                        "FROM variant WHERE task_id = ? ORDER BY rank",
                 taskId);
 
         System.out.printf("[P2-2 METRIC] Вариантов: %d%n", variants.size());
@@ -166,12 +165,9 @@ class HybridConnectivityIT extends BasePostgresIntegrationTest {
                     v.get("construction_cost"), v.get("new_network_length"));
         }
 
-        // ТЗ 2.8: «основной + до двух содержательно отличающихся». Дедупликация
-        // отсеивает идентичные, поэтому 1..3.
         assertTrue(variants.size() >= 1 && variants.size() <= 3,
                 "ТЗ 2.8: 1–3 варианта, получено " + variants.size());
 
-        // Все варианты должны иметь уникальный score (после дедупликации)
         Set<Double> scores = new HashSet<>();
         for (Map<String, Object> v : variants) {
             double s = Math.round(((Number) v.get("score")).doubleValue() * 10000.0) / 10000.0;
@@ -179,18 +175,16 @@ class HybridConnectivityIT extends BasePostgresIntegrationTest {
                     "После дедупликации score должны быть уникальны, дубликат: " + s);
         }
 
-        // P3.1: на конкурсном наборе все OKS подключены → штраф 0, массив пуст
+        // P3.1: на конкурсном наборе все OKS подключены → штраф 0.
         for (Map<String, Object> v : variants) {
             Number penalty = (Number) v.get("unconnected_penalty");
             Object ids = v.get("unconnected_oks_ids");
             System.out.printf("          %s unconnected_penalty=%s unconnected_oks_ids=%s%n",
                     v.get("id"), penalty, ids);
             assertEquals(0.0, penalty.doubleValue(), 0.01,
-                    "На конкурсном наборе все 17 OKS подключены → штраф 0");
+                    "На конкурсном наборе все OKS подключены → штраф 0");
         }
-        // rank 1 = минимальный score, score монотонно растёт по rank.
-        // Проверяем без жёсткого обращения к get(2): после дедупликации
-        // вариантов может быть 1, 2 или 3 (ТЗ 2.8).
+
         assertEquals(1, ((Number) variants.get(0).get("rank")).intValue(),
                 "rank 1 должен быть у минимального score");
         for (int i = 1; i < variants.size(); i++) {
@@ -200,5 +194,78 @@ class HybridConnectivityIT extends BasePostgresIntegrationTest {
                     "Ранжирование нарушено: rank " + i + " score=" + prev +
                             " > rank " + (i + 1) + " score=" + cur);
         }
+
+        // ==================================================================
+        // V46: инварианты физической топологии новой сети
+        // ==================================================================
+
+        // V46-a: 0 пересечений сегментов вне общих узлов (ТЗ 2.1).
+        Long badCrossings = jdbcTemplate.queryForObject(
+                "SELECT count(*) FROM physical_segment a " +
+                        "JOIN physical_segment b " +
+                        "  ON a.task_id = b.task_id " +
+                        " AND a.variant_id = b.variant_id " +
+                        " AND a.id < b.id " +
+                        "WHERE a.task_id = ? " +
+                        "  AND ST_Intersects(a.geom, b.geom) " +
+                        "  AND NOT ST_Touches(a.geom, b.geom)",
+                Long.class, taskId);
+        assertNotNull(badCrossings);
+        assertEquals(0L, badCrossings.longValue(),
+                "V46 (ТЗ 2.1): пересечений сегментов вне общих узлов быть не должно. " +
+                        "ST_Node не справился с планаризацией.");
+
+        // V46-b: degree ≤ 4 во всех физических узлах (ТЗ 2.3).
+        List<Map<String, Object>> overDeg = jdbcTemplate.queryForList(
+                "SELECT id, node_type, degree FROM physical_node " +
+                        "WHERE task_id = ? AND degree > 4",
+                taskId);
+        assertTrue(overDeg.isEmpty(),
+                "V46 (ТЗ 2.3): узлов с degree > 4 быть не должно: " + overDeg);
+
+        // V46-c: агрегация flow на общем участке (ТЗ 2.3).
+        // На общем сегменте flow_tph > flow любой отдельной точки OKS.
+        Long aggregatedSegments = jdbcTemplate.queryForObject(
+                "SELECT count(*) FROM physical_segment s " +
+                        "WHERE s.task_id = ? AND s.variant_id = 'v1' " +
+                        "  AND s.flow_tph > (SELECT MAX((f.properties->>'flow_tph')::double precision) " +
+                        "                    FROM input_feature f " +
+                        "                    WHERE f.task_id = ? " +
+                        "                      AND f.object_type = 'oks_connection_point')",
+                Long.class, taskId, taskId);
+        assertNotNull(aggregatedSegments);
+        assertTrue(aggregatedSegments > 0,
+                "V46 (ТЗ 2.3): на общих участках flow должен быть агрегирован — " +
+                        "хотя бы один сегмент с flow_tph > flow отдельной OKS.");
+
+        // V46-d: ДУ сегментов присутствует и осмыслен (подобран DiameterPicker).
+        //   - не NULL на всех сегментах варианта v1;
+        //   - входит в таблицу 1 ТЗ.
+        Long nullDiam = jdbcTemplate.queryForObject(
+                "SELECT count(*) FROM physical_segment " +
+                        "WHERE task_id = ? AND variant_id = 'v1' AND diameter IS NULL",
+                Long.class, taskId);
+        assertEquals(0L, nullDiam.longValue(),
+                "V46: diameter должен быть заполнен на всех сегментах (DiameterPicker).");
+
+        Long badDiam = jdbcTemplate.queryForObject(
+                "SELECT count(*) FROM physical_segment " +
+                        "WHERE task_id = ? AND variant_id = 'v1' " +
+                        "  AND diameter NOT IN (50,65,80,100,125,150,200,250,300,400,500,600,700,800,900,1000,1200,1400)",
+                Long.class, taskId);
+        assertEquals(0L, badDiam.longValue(),
+                "V46: диаметр вне таблицы 1 ТЗ.");
+
+        // Метрика по физической топологии — для отладки.
+        Long segCount = jdbcTemplate.queryForObject(
+                "SELECT count(*) FROM physical_segment WHERE task_id = ? AND variant_id = 'v1'",
+                Long.class, taskId);
+        Long nodeCount = jdbcTemplate.queryForObject(
+                "SELECT count(*) FROM physical_node WHERE task_id = ? AND variant_id = 'v1'",
+                Long.class, taskId);
+
+        System.out.printf("[V46 METRIC] v1: segments=%d, nodes=%d, " +
+                        "bad_crossings=%d, degree_gt_4=%d, aggregated_segments=%d%n",
+                segCount, nodeCount, badCrossings, overDeg.size(), aggregatedSegments);
     }
 }
