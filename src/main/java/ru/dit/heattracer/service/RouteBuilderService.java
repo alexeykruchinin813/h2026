@@ -182,9 +182,10 @@ public class RouteBuilderService {
             }
         }
 
-        // 10. Записываем edges и chambers в variant_feature
+        // 10. Записываем edges, chambers и technical_nodes в variant_feature
         writeEdges(taskId, variantId, edges);
         writeChambers(taskId, variantId, chamberSpec, targetInfo);
+        int technicalNodeCount = writeTechnicalNodes(taskId, variantId, edges);
 
         // 11. Сводка с учётом неподключённых OKS (P3.1, ТЗ 2.9 и 6)
         double constructionCost = totalSegmentCost + chamberCost + tieInCost;
@@ -208,9 +209,10 @@ public class RouteBuilderService {
         for (EdgeRow e : edges.values()) if (e.isSpecial) specialEdges++;
 
         log.info("[{}] RouteBuilder done in {} ms: edges={} ({} special), chambers={}, tieIn={}, " +
-                        "len={} m, segmentCost={}, chamberCost={}, tieInCost={}, score={}",
+                        "technicalNodes={}, len={} m, segmentCost={}, chamberCost={}, tieInCost={}, score={}",
                 taskId, System.currentTimeMillis() - start,
                 edges.size(), specialEdges, newChamberCount, existingTieInCount,
+                technicalNodeCount,
                 String.format("%.1f", totalLength),
                 String.format("%.0f", totalSegmentCost),
                 String.format("%.0f", chamberCost),
@@ -462,6 +464,91 @@ public class RouteBuilderService {
                 log.error("[{}] writeChamber for target {} failed: {}", taskId, tv, ex.getMessage());
             }
         }
+    }
+
+    /**
+     * P3.2 (ТЗ 7.1): создаёт technical_node в узлах смены ДУ или laying_method
+     * между двумя последовательными рёбрами одного варианта.
+     *
+     * Узел становится technical_node, если:
+     *   - через него проходит РОВНО 2 ребра;
+     *   - эти рёбра отличаются diameter ИЛИ is_special;
+     *   - узел не является OKS и не является target (там heat_chamber).
+     *
+     * Узлы с 3+ рёбрами — разветвления, по ТЗ 7.1 выполняются только в камерах.
+     *
+     * @return количество созданных technical_node
+     */
+    private int writeTechnicalNodes(UUID taskId, String variantId, Map<Long, EdgeRow> edges) {
+        // 1. Degree-карта: node_id → список edge_id, примыкающих к узлу
+        Map<Long, List<Long>> nodeEdges = new HashMap<>();
+        for (EdgeRow e : edges.values()) {
+            nodeEdges.computeIfAbsent(e.sourceVertex, k -> new ArrayList<>()).add(e.id);
+            nodeEdges.computeIfAbsent(e.targetVertex, k -> new ArrayList<>()).add(e.id);
+        }
+
+        // 2. Запрещённые узлы: OKS, target (heat_chamber)
+        Set<Long> forbidden = new HashSet<>();
+        jdbc.query(
+                "SELECT id FROM visibility_vertex " +
+                        "WHERE task_id = ? AND vertex_type IN ('oks', 'candidate')",
+                rs -> { forbidden.add(rs.getLong("id")); },
+                taskId);
+        jdbc.query(
+                "SELECT DISTINCT target_vertex_id FROM path_result " +
+                        "WHERE task_id = ? AND variant_id = ?",
+                rs -> { forbidden.add(rs.getLong("target_vertex_id")); },
+                taskId, variantId);
+
+        // 3. Ищем узлы с degree==2 и сменой параметров
+        int written = 0;
+        for (Map.Entry<Long, List<Long>> entry : nodeEdges.entrySet()) {
+            Long nodeId = entry.getKey();
+            List<Long> eids = entry.getValue();
+            if (eids.size() != 2) continue;
+            if (forbidden.contains(nodeId)) continue;
+
+            EdgeRow e1 = edges.get(eids.get(0));
+            EdgeRow e2 = edges.get(eids.get(1));
+            if (e1 == null || e2 == null) continue;
+
+            boolean diamChanged = e1.spec.getDiameter() != e2.spec.getDiameter();
+            boolean layChanged  = e1.isSpecial != e2.isSpecial;
+            if (!diamChanged && !layChanged) continue;
+
+            try {
+                Map<String, Object> props = new LinkedHashMap<>();
+                props.put("variant_id", variantId);
+                if (diamChanged) {
+                    props.put("diameter_from", e1.spec.getDiameter());
+                    props.put("diameter_to",   e2.spec.getDiameter());
+                }
+                if (layChanged) {
+                    props.put("laying_from", e1.isSpecial ? "special" : "base");
+                    props.put("laying_to",   e2.isSpecial ? "special" : "base");
+                }
+                String json = mapper.writeValueAsString(props);
+
+                jdbc.update(
+                        "INSERT INTO technical_node (task_id, variant_id, geom) " +
+                                "SELECT ?, ?, vv.geom FROM visibility_vertex vv WHERE vv.id = ?",
+                        taskId, variantId, nodeId);
+
+                jdbc.update(
+                        "INSERT INTO variant_feature " +
+                                "  (task_id, variant_id, feature_id, object_type, properties, geom_utm, geom_4326) " +
+                                "SELECT ?, ?, ?, 'technical_node', ?::jsonb, vv.geom, " +
+                                "       ST_Transform(vv.geom, 4326) " +
+                                "FROM visibility_vertex vv WHERE vv.id = ?",
+                        taskId, variantId, "tn_" + variantId + "_" + nodeId, json, nodeId);
+
+                written++;
+            } catch (Exception ex) {
+                log.error("[{}][{}] writeTechnicalNode node={} failed: {}",
+                        taskId, variantId, nodeId, ex.getMessage());
+            }
+        }
+        return written;
     }
 
     private void writeSummary(UUID taskId, String variantId,
