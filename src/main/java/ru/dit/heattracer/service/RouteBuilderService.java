@@ -57,6 +57,35 @@ public class RouteBuilderService {
     }
 
     /**
+     * P3.1 (ТЗ 2.9, 6): OKS, для которых в данном варианте нет пути.
+     * Штраф = 100_000_000 + 500_000 × flow_tph (ТЗ 6).
+     */
+    private UnconnectedInfo computeUnconnected(UUID taskId, String variantId) {
+        List<Map<String, Object>> rows = jdbc.queryForList(
+                "SELECT vv.ref_id AS oks_id, " +
+                        "       (f.properties->>'flow_tph')::double precision AS flow " +
+                        "FROM visibility_vertex vv " +
+                        "JOIN input_feature f " +
+                        "  ON f.task_id = vv.task_id AND f.feature_id::text = vv.ref_id " +
+                        "WHERE vv.task_id = ? AND vv.vertex_type = 'oks' " +
+                        "  AND f.object_type = 'oks_connection_point' " +
+                        "  AND NOT EXISTS ( " +
+                        "    SELECT 1 FROM path_result pr " +
+                        "    WHERE pr.task_id = vv.task_id " +
+                        "      AND pr.variant_id = ? " +
+                        "      AND pr.oks_vertex_id = vv.id )",
+                taskId, variantId);
+
+        UnconnectedInfo info = new UnconnectedInfo();
+        for (Map<String, Object> r : rows) {
+            info.ids.add(String.valueOf(r.get("oks_id")));
+            double flow = ((Number) r.get("flow")).doubleValue();
+            info.penalty += 100_000_000.0 + 500_000.0 * flow;
+        }
+        return info;
+    }
+
+    /**
      * Полный пайплайн: считает маршрут и пишет variant_feature для данного variantId.
      *
      * @return variantId (тот же, что передан)
@@ -157,14 +186,23 @@ public class RouteBuilderService {
         writeEdges(taskId, variantId, edges);
         writeChambers(taskId, variantId, chamberSpec, targetInfo);
 
-        // 11. Сводка
+        // 11. Сводка с учётом неподключённых OKS (P3.1, ТЗ 2.9 и 6)
         double constructionCost = totalSegmentCost + chamberCost + tieInCost;
-        double score = SCORE_W_COST * (constructionCost / SCORE_COST_SCALE)
+
+        UnconnectedInfo unconn = computeUnconnected(taskId, variantId);
+        double calculatedCost = constructionCost + unconn.penalty;
+        double score = SCORE_W_COST * (calculatedCost / SCORE_COST_SCALE)
                 + SCORE_W_LENGTH * (totalLength / SCORE_LENGTH_SCALE);
+
+        if (!unconn.ids.isEmpty()) {
+            log.warn("[{}][{}] Не подключено OKS: {} (штраф {} ₽)",
+                    taskId, variantId, unconn.ids.size(),
+                    String.format("%.0f", unconn.penalty));
+        }
 
         writeSummary(taskId, variantId,
                 constructionCost, chamberCost, existingTieInCount, tieInCost,
-                0.0, constructionCost, totalLength, score, new ArrayList<>());
+                unconn.penalty, calculatedCost, totalLength, score, unconn.ids);
 
         int specialEdges = 0;
         for (EdgeRow e : edges.values()) if (e.isSpecial) specialEdges++;
@@ -475,13 +513,22 @@ public class RouteBuilderService {
     }
 
     private void writeEmptySummary(UUID taskId, String variantId) {
-        writeSummary(taskId, variantId, 0, 0, 0, 0, 0, 0, 0, 0, new ArrayList<>());
+        UnconnectedInfo unconn = computeUnconnected(taskId, variantId);
+        double calculatedCost = unconn.penalty;
+        double score = SCORE_W_COST * (calculatedCost / SCORE_COST_SCALE);
+        writeSummary(taskId, variantId,
+                0, 0, 0, 0, unconn.penalty, calculatedCost, 0, score, unconn.ids);
     }
 
     private static double round2(double v) { return Math.round(v * 100.0) / 100.0; }
     private static double round4(double v) { return Math.round(v * 10000.0) / 10000.0; }
 
     // ===== Внутренние структуры =====
+
+    static class UnconnectedInfo {
+        final List<String> ids = new ArrayList<>();
+        double penalty = 0.0;
+    }
 
     static class PathRow {
         int clusterId;

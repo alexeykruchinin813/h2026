@@ -158,8 +158,9 @@ class HybridConnectivityIT extends BasePostgresIntegrationTest {
 
         // ===== P2.2: три содержательно отличающихся варианта =====
         List<Map<String, Object>> variants = jdbcTemplate.queryForList(
-                "SELECT id, rank, score, construction_cost, new_network_length " +
-                        "FROM variant WHERE task_id = ? ORDER BY rank",
+            "SELECT id, rank, score, construction_cost, new_network_length, " +
+                "       unconnected_penalty, unconnected_oks_ids " +
+                "FROM variant WHERE task_id = ? ORDER BY rank",
                 taskId);
 
         System.out.printf("[P2-2 METRIC] Вариантов: %d%n", variants.size());
@@ -167,6 +168,16 @@ class HybridConnectivityIT extends BasePostgresIntegrationTest {
             System.out.printf("          %s rank=%s score=%s cost=%s length=%s%n",
                     v.get("id"), v.get("rank"), v.get("score"),
                     v.get("construction_cost"), v.get("new_network_length"));
+        }
+
+        // P3.1: на конкурсном наборе все OKS подключены → штраф 0, массив пуст
+        for (Map<String, Object> v : variants) {
+            Number penalty = (Number) v.get("unconnected_penalty");
+            Object ids = v.get("unconnected_oks_ids");
+            System.out.printf("          %s unconnected_penalty=%s unconnected_oks_ids=%s%n",
+                    v.get("id"), penalty, ids);
+            assertEquals(0.0, penalty.doubleValue(), 0.01,
+                    "На конкурсном наборе все 17 OKS подключены → штраф 0");
         }
 
         assertEquals(3, variants.size(), "ТЗ 2.8: должно быть 3 варианта");
