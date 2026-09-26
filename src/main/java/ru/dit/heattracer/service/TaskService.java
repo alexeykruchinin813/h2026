@@ -33,6 +33,8 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 
+import java.sql.Array;
+
 @Service
 public class TaskService {
 
@@ -54,6 +56,7 @@ public class TaskService {
     private final HybridVisibilityGraphService hybridVisibilityGraphService;
     private final PathFinderService pathFinderService;
     private final DiameterPicker diameterPicker;
+    private final RouteBuilderService routeBuilderService;
 
     public TaskService(
             @Qualifier("calcExecutor") Executor calcExecutor,
@@ -70,7 +73,9 @@ public class TaskService {
             VisibilityGraphService visibilityGraphService,
             HybridVisibilityGraphService hybridVisibilityGraphService,
             PathFinderService pathFinderService,
-            DiameterPicker diameterPicker) throws IOException {
+            DiameterPicker diameterPicker,
+            RouteBuilderService routeBuilderService
+            ) throws IOException {
         this.calcExecutor = calcExecutor;
         this.storageRoot = Paths.get(storageDir);
         this.geoJsonReader = geoJsonReader;
@@ -86,6 +91,7 @@ public class TaskService {
         this.hybridVisibilityGraphService = hybridVisibilityGraphService;
         this.pathFinderService = pathFinderService;
         this.diameterPicker = diameterPicker;
+        this.routeBuilderService = routeBuilderService;
         Files.createDirectories(storageRoot);
         log.info("Storage root: {}", storageRoot.toAbsolutePath());
     }
@@ -266,6 +272,7 @@ public class TaskService {
                                 String.format("%.2f", best.getTotalCost()),
                                 String.format("%.2f", best.getTotalLength()),
                                 best.getEdgeCount());
+                        savePath(id, cluster.getClusterId(), oksVertex, best);
                         totalPaths++;
                     } else {
                         log.warn("[{}]   OKS {} → NO PATH FOUND", id, oksVertex);
@@ -276,23 +283,33 @@ public class TaskService {
 
             log.info("[{}] Total paths found: {}, OKS without path: {}",
                     id, totalPaths, totalOksWithoutPath);
+
+            // P1-1: метрика для теста HybridConnectivityIT (assert >= 15/17)
+            int oksTotal = totalPaths + totalOksWithoutPath;
             System.out.printf("[P1-1 METRIC] ОКС с найденным путём: %d из %d%n",
-                    totalPaths, totalPaths + totalOksWithoutPath);
+                    totalPaths, oksTotal);
 
             state.setPercent(92);
             state.setStage("PATHS_FOUND");
 
-            // ===== 8. ЭКСПОРТ РЕЗУЛЬТАТА (пока echo input_feature) =====
-            state.setStage("EXPORTING");
+            // ===== 8. ПОСТРОЕНИЕ МАРШРУТА (P1.3) =====
+            state.setStage("BUILDING_ROUTE");
             state.setPercent(93);
 
+            String variantId = routeBuilderService.buildRoute(id, "v1");
+            log.info("[{}] Route built: variantId={}", id, variantId);
+
+            // ===== 9. ЭКСПОРТ РЕЗУЛЬТАТА =====
+            state.setStage("EXPORTING");
+            state.setPercent(95);
+
             Path resultPath = state.getInputPath().getParent().resolve("result.geojson");
-            long written = exportService.exportInputFeatures(id, resultPath);
+            long written = exportService.exportVariantFeatures(id, variantId, resultPath);
 
             log.info("[{}] Result written: {} features to {}", id, written, resultPath);
             state.setResultPath(resultPath);
 
-            // ===== 9. ЗАВЕРШЕНИЕ =====
+            // ===== 10. ЗАВЕРШЕНИЕ =====
             state.setPercent(100);
             state.setStage("DONE");
             state.setStatus(TaskState.Status.DONE);
@@ -315,6 +332,45 @@ public class TaskService {
                     e.getMessage(), id);
         } finally {
             state.markFinished();
+        }
+    }
+
+    /**
+     * V42: сохраняет путь A* в path_result для последующего экспорта GeoJSON.
+     * ON CONFLICT защищает от повторного вызова (idempotent retry пайплайна).
+     */
+    private void savePath(UUID taskId, int clusterId, long oksVertex, PathResult path) {
+        try {
+            jdbcTemplate.update(con -> {
+                var ps = con.prepareStatement(
+                        "INSERT INTO path_result " +
+                                "  (task_id, cluster_id, oks_vertex_id, target_vertex_id, " +
+                                "   path_geom, total_cost, total_length_m, edge_count, edge_ids) " +
+                                "VALUES (?, ?, ?, ?, ST_GeomFromText(?, 32637), ?, ?, ?, ?) " +
+                                "ON CONFLICT (task_id, oks_vertex_id) DO UPDATE SET " +
+                                "   cluster_id       = EXCLUDED.cluster_id, " +
+                                "   target_vertex_id = EXCLUDED.target_vertex_id, " +
+                                "   path_geom        = EXCLUDED.path_geom, " +
+                                "   total_cost       = EXCLUDED.total_cost, " +
+                                "   total_length_m   = EXCLUDED.total_length_m, " +
+                                "   edge_count       = EXCLUDED.edge_count, " +
+                                "   edge_ids         = EXCLUDED.edge_ids");
+                ps.setObject(1, taskId);
+                ps.setInt(2, clusterId);
+                ps.setLong(3, oksVertex);
+                ps.setLong(4, path.getToVertex());
+                ps.setString(5, path.getPathWkt());
+                ps.setDouble(6, path.getTotalCost());
+                ps.setDouble(7, path.getTotalLength());
+                ps.setInt(8, path.getEdgeCount());
+                Long[] ids = path.getEdgeIds().toArray(new Long[0]);
+                ps.setArray(9, con.createArrayOf("bigint", ids));
+                return ps;
+            });
+        } catch (Exception e) {
+            log.error("[{}] savePath failed for OKS vertex {} (path length {} m): {}",
+                    taskId, oksVertex, path.getTotalLength(), e.getMessage());
+            // Не падаем: по ТЗ п. 2.9 частичный результат допустим.
         }
     }
 

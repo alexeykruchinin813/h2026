@@ -127,5 +127,22 @@ class HybridConnectivityIT extends BasePostgresIntegrationTest {
                 String.format("Недостаточная связность графа: только %d из %d ОКС имеют рёбра к чужим вершинам. " +
                                 "Цель P0: >= %d. Требуется tuning гибридного валидатора или escape points.",
                         connectedOksCount, totalOksCount, targetConnected));
+
+        // ===== P1-1: пути A* (V42) =====
+        Integer oksWithPath = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM path_result WHERE task_id = ?",
+                Integer.class, taskId);
+
+        assertNotNull(oksWithPath, "Запрос path_result не должен возвращать null");
+
+        System.out.printf("[P1-1 METRIC] ОКС с найденным путём в path_result: %d из %d%n",
+                oksWithPath, totalOksCount);
+
+        // Регрессионный барьер: после V41 факт = 17/17; допускаем 1 не найденный на всякий случай.
+        int minWithPath = Math.min(16, totalOksCount);
+        assertTrue(oksWithPath >= minWithPath,
+                String.format("Недостаточно OKS с путём: только %d из %d (минимум %d). " +
+                                "Проверь create_escape_points (V41) и find_best_path_from_oks (V21).",
+                        oksWithPath, totalOksCount, minWithPath));
     }
 }
