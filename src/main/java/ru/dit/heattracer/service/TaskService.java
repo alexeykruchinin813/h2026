@@ -464,6 +464,17 @@ public class TaskService {
                     id, written, resultPath);
             state.setResultPath(resultPath);
 
+            try {
+                for (String vid : uniqueVariants) {
+                    Path variantFile = state.getInputPath().getParent()
+                            .resolve("result_" + vid + ".geojson");
+                    exportService.exportVariantFeatures(id, vid, variantFile);
+                }
+                log.info("[{}] Split variant files written to {}", id, state.getInputPath().getParent());
+            } catch (Exception ex) {
+                log.warn("[{}] Split variant export failed: {}", id, ex.getMessage());
+            }
+
             // ===== 10. ЗАВЕРШЕНИЕ =====
             state.setPercent(100);
             state.setStage("DONE");

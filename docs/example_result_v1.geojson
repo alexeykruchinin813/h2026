@@ -1,0 +1,749 @@
+{
+    "features":  [
+                     {
+                         "type":  "Feature",
+                         "geometry":  {
+                                          "type":  "LineString",
+                                          "coordinates":  [
+                                                              [
+                                                                  37.640764466,
+                                                                  55.698407392
+                                                              ],
+                                                              [
+                                                                  37.639557137,
+                                                                  55.69865159
+                                                              ]
+                                                          ]
+                                      },
+                         "properties":  {
+                                            "cost":  9695488.03,
+                                            "length":  80.61,
+                                            "diameter":  200,
+                                            "flow_tph":  76.27,
+                                            "depth_end":  null,
+                                            "variant_id":  "v1",
+                                            "depth_start":  null,
+                                            "end_node_id":  "1455",
+                                            "laying_method":  "base",
+                                            "start_node_id":  "1454",
+                                            "object_type":  "heat_network",
+                                            "id":  "p_v1_1454"
+                                        }
+                     },
+                     {
+                         "type":  "Feature",
+                         "geometry":  {
+                                          "type":  "LineString",
+                                          "coordinates":  [
+                                                              [
+                                                                  37.638461839,
+                                                                  55.697638533
+                                                              ],
+                                                              [
+                                                                  37.635417056,
+                                                                  55.698614732
+                                                              ],
+                                                              [
+                                                                  37.635333306,
+                                                                  55.698475132
+                                                              ],
+                                                              [
+                                                                  37.635082576,
+                                                                  55.698312476
+                                                              ],
+                                                              [
+                                                                  37.634205497,
+                                                                  55.697892803
+                                                              ],
+                                                              [
+                                                                  37.633901056,
+                                                                  55.697722607
+                                                              ]
+                                                          ]
+                                      },
+                         "properties":  {
+                                            "cost":  32280201.65,
+                                            "length":  359.68,
+                                            "diameter":  100,
+                                            "flow_tph":  19.77,
+                                            "depth_end":  null,
+                                            "variant_id":  "v1",
+                                            "depth_start":  null,
+                                            "end_node_id":  "1490",
+                                            "laying_method":  "base",
+                                            "start_node_id":  "1475",
+                                            "object_type":  "heat_network",
+                                            "id":  "p_v1_1475"
+                                        }
+                     },
+                     {
+                         "type":  "Feature",
+                         "geometry":  {
+                                          "type":  "LineString",
+                                          "coordinates":  [
+                                                              [
+                                                                  37.634405404,
+                                                                  55.699481064
+                                                              ],
+                                                              [
+                                                                  37.634963485,
+                                                                  55.699015136
+                                                              ],
+                                                              [
+                                                                  37.635238998,
+                                                                  55.698855509
+                                                              ],
+                                                              [
+                                                                  37.635417056,
+                                                                  55.698614732
+                                                              ],
+                                                              [
+                                                                  37.638461839,
+                                                                  55.697638533
+                                                              ]
+                                                          ]
+                                      },
+                         "properties":  {
+                                            "cost":  32737317.6,
+                                            "length":  336.54,
+                                            "diameter":  125,
+                                            "flow_tph":  24.87,
+                                            "depth_end":  null,
+                                            "variant_id":  "v1",
+                                            "depth_start":  null,
+                                            "end_node_id":  "1490",
+                                            "laying_method":  "base",
+                                            "start_node_id":  "1476",
+                                            "object_type":  "heat_network",
+                                            "id":  "p_v1_1476"
+                                        }
+                     },
+                     {
+                         "type":  "Feature",
+                         "geometry":  {
+                                          "type":  "LineString",
+                                          "coordinates":  [
+                                                              [
+                                                                  37.634582926,
+                                                                  55.699854464
+                                                              ],
+                                                              [
+                                                                  37.634651523,
+                                                                  55.699696985
+                                                              ],
+                                                              [
+                                                                  37.635553096,
+                                                                  55.69932127
+                                                              ],
+                                                              [
+                                                                  37.635417056,
+                                                                  55.698614732
+                                                              ],
+                                                              [
+                                                                  37.638461839,
+                                                                  55.697638533
+                                                              ]
+                                                          ]
+                                      },
+                         "properties":  {
+                                            "cost":  34792068.67,
+                                            "length":  387.66,
+                                            "diameter":  100,
+                                            "flow_tph":  18.76,
+                                            "depth_end":  null,
+                                            "variant_id":  "v1",
+                                            "depth_start":  null,
+                                            "end_node_id":  "1490",
+                                            "laying_method":  "base",
+                                            "start_node_id":  "1477",
+                                            "object_type":  "heat_network",
+                                            "id":  "p_v1_1477"
+                                        }
+                     },
+                     {
+                         "type":  "Feature",
+                         "geometry":  {
+                                          "type":  "LineString",
+                                          "coordinates":  [
+                                                              [
+                                                                  37.632846602,
+                                                                  55.70027576
+                                                              ],
+                                                              [
+                                                                  37.632745397,
+                                                                  55.70010957
+                                                              ],
+                                                              [
+                                                                  37.634268624,
+                                                                  55.699336188
+                                                              ],
+                                                              [
+                                                                  37.635238998,
+                                                                  55.698855509
+                                                              ],
+                                                              [
+                                                                  37.635417056,
+                                                                  55.698614732
+                                                              ],
+                                                              [
+                                                                  37.638461839,
+                                                                  55.697638533
+                                                              ]
+                                                          ]
+                                      },
+                         "properties":  {
+                                            "cost":  46552799.48,
+                                            "length":  478.57,
+                                            "diameter":  125,
+                                            "flow_tph":  29.42,
+                                            "depth_end":  null,
+                                            "variant_id":  "v1",
+                                            "depth_start":  null,
+                                            "end_node_id":  "1490",
+                                            "laying_method":  "base",
+                                            "start_node_id":  "1478",
+                                            "object_type":  "heat_network",
+                                            "id":  "p_v1_1478"
+                                        }
+                     },
+                     {
+                         "type":  "Feature",
+                         "geometry":  {
+                                          "type":  "LineString",
+                                          "coordinates":  [
+                                                              [
+                                                                  37.636381851,
+                                                                  55.700155199
+                                                              ],
+                                                              [
+                                                                  37.635986669,
+                                                                  55.699413904
+                                                              ],
+                                                              [
+                                                                  37.635784206,
+                                                                  55.698923763
+                                                              ],
+                                                              [
+                                                                  37.635417056,
+                                                                  55.698614732
+                                                              ],
+                                                              [
+                                                                  37.638461839,
+                                                                  55.697638533
+                                                              ]
+                                                          ]
+                                      },
+                         "properties":  {
+                                            "cost":  42591804.31,
+                                            "length":  403.69,
+                                            "diameter":  150,
+                                            "flow_tph":  47.7,
+                                            "depth_end":  null,
+                                            "variant_id":  "v1",
+                                            "depth_start":  null,
+                                            "end_node_id":  "1490",
+                                            "laying_method":  "base",
+                                            "start_node_id":  "1479",
+                                            "object_type":  "heat_network",
+                                            "id":  "p_v1_1479"
+                                        }
+                     },
+                     {
+                         "type":  "Feature",
+                         "geometry":  {
+                                          "type":  "LineString",
+                                          "coordinates":  [
+                                                              [
+                                                                  37.635417056,
+                                                                  55.698614732
+                                                              ],
+                                                              [
+                                                                  37.638461839,
+                                                                  55.697638533
+                                                              ]
+                                                          ]
+                                      },
+                         "properties":  {
+                                            "cost":  21408476.55,
+                                            "length":  220.08,
+                                            "diameter":  125,
+                                            "flow_tph":  26.09,
+                                            "depth_end":  null,
+                                            "variant_id":  "v1",
+                                            "depth_start":  null,
+                                            "end_node_id":  "1490",
+                                            "laying_method":  "base",
+                                            "start_node_id":  "1480",
+                                            "object_type":  "heat_network",
+                                            "id":  "p_v1_1480"
+                                        }
+                     },
+                     {
+                         "type":  "Feature",
+                         "geometry":  {
+                                          "type":  "LineString",
+                                          "coordinates":  [
+                                                              [
+                                                                  37.638461839,
+                                                                  55.697638533
+                                                              ],
+                                                              [
+                                                                  37.635417056,
+                                                                  55.698614732
+                                                              ],
+                                                              [
+                                                                  37.635629112,
+                                                                  55.698693697
+                                                              ],
+                                                              [
+                                                                  37.634327237,
+                                                                  55.699635455
+                                                              ],
+                                                              [
+                                                                  37.632162838,
+                                                                  55.700072039
+                                                              ],
+                                                              [
+                                                                  37.632012226,
+                                                                  55.700048261
+                                                              ]
+                                                          ]
+                                      },
+                         "properties":  {
+                                            "cost":  46967013.11,
+                                            "length":  523.32,
+                                            "diameter":  100,
+                                            "flow_tph":  15.99,
+                                            "depth_end":  null,
+                                            "variant_id":  "v1",
+                                            "depth_start":  null,
+                                            "end_node_id":  "1490",
+                                            "laying_method":  "base",
+                                            "start_node_id":  "1481",
+                                            "object_type":  "heat_network",
+                                            "id":  "p_v1_1481"
+                                        }
+                     },
+                     {
+                         "type":  "Feature",
+                         "geometry":  {
+                                          "type":  "LineString",
+                                          "coordinates":  [
+                                                              [
+                                                                  37.638461839,
+                                                                  55.697638533
+                                                              ],
+                                                              [
+                                                                  37.635417056,
+                                                                  55.698614732
+                                                              ],
+                                                              [
+                                                                  37.635238998,
+                                                                  55.698855509
+                                                              ],
+                                                              [
+                                                                  37.634268624,
+                                                                  55.699336188
+                                                              ],
+                                                              [
+                                                                  37.632321558,
+                                                                  55.700263158
+                                                              ],
+                                                              [
+                                                                  37.632202634,
+                                                                  55.700314417
+                                                              ]
+                                                          ]
+                                      },
+                         "properties":  {
+                                            "cost":  44849947.54,
+                                            "length":  499.73,
+                                            "diameter":  100,
+                                            "flow_tph":  18.03,
+                                            "depth_end":  null,
+                                            "variant_id":  "v1",
+                                            "depth_start":  null,
+                                            "end_node_id":  "1490",
+                                            "laying_method":  "base",
+                                            "start_node_id":  "1482",
+                                            "object_type":  "heat_network",
+                                            "id":  "p_v1_1482"
+                                        }
+                     },
+                     {
+                         "type":  "Feature",
+                         "geometry":  {
+                                          "type":  "LineString",
+                                          "coordinates":  [
+                                                              [
+                                                                  37.634446268,
+                                                                  55.697252392
+                                                              ],
+                                                              [
+                                                                  37.634289664,
+                                                                  55.697393635
+                                                              ],
+                                                              [
+                                                                  37.635082576,
+                                                                  55.698312476
+                                                              ],
+                                                              [
+                                                                  37.635333306,
+                                                                  55.698475132
+                                                              ],
+                                                              [
+                                                                  37.635417056,
+                                                                  55.698614732
+                                                              ],
+                                                              [
+                                                                  37.638461839,
+                                                                  55.697638533
+                                                              ]
+                                                          ]
+                                      },
+                         "properties":  {
+                                            "cost":  38210300.93,
+                                            "length":  392.81,
+                                            "diameter":  125,
+                                            "flow_tph":  34.53,
+                                            "depth_end":  null,
+                                            "variant_id":  "v1",
+                                            "depth_start":  null,
+                                            "end_node_id":  "1490",
+                                            "laying_method":  "base",
+                                            "start_node_id":  "1483",
+                                            "object_type":  "heat_network",
+                                            "id":  "p_v1_1483"
+                                        }
+                     },
+                     {
+                         "type":  "Feature",
+                         "geometry":  {
+                                          "type":  "LineString",
+                                          "coordinates":  [
+                                                              [
+                                                                  37.63609324,
+                                                                  55.697296569
+                                                              ],
+                                                              [
+                                                                  37.635980075,
+                                                                  55.697449098
+                                                              ],
+                                                              [
+                                                                  37.635333306,
+                                                                  55.698475132
+                                                              ],
+                                                              [
+                                                                  37.635417056,
+                                                                  55.698614732
+                                                              ],
+                                                              [
+                                                                  37.638461839,
+                                                                  55.697638533
+                                                              ]
+                                                          ]
+                                      },
+                         "properties":  {
+                                            "cost":  36586489.35,
+                                            "length":  376.11,
+                                            "diameter":  125,
+                                            "flow_tph":  33.14,
+                                            "depth_end":  null,
+                                            "variant_id":  "v1",
+                                            "depth_start":  null,
+                                            "end_node_id":  "1490",
+                                            "laying_method":  "base",
+                                            "start_node_id":  "1484",
+                                            "object_type":  "heat_network",
+                                            "id":  "p_v1_1484"
+                                        }
+                     },
+                     {
+                         "type":  "Feature",
+                         "geometry":  {
+                                          "type":  "LineString",
+                                          "coordinates":  [
+                                                              [
+                                                                  37.638461839,
+                                                                  55.697638533
+                                                              ],
+                                                              [
+                                                                  37.635417056,
+                                                                  55.698614732
+                                                              ],
+                                                              [
+                                                                  37.635238998,
+                                                                  55.698855509
+                                                              ],
+                                                              [
+                                                                  37.634963485,
+                                                                  55.699015136
+                                                              ],
+                                                              [
+                                                                  37.633461561,
+                                                                  55.699510742
+                                                              ],
+                                                              [
+                                                                  37.633204499,
+                                                                  55.699575075
+                                                              ]
+                                                          ]
+                                      },
+                         "properties":  {
+                                            "cost":  31527020.82,
+                                            "length":  400.95,
+                                            "diameter":  65,
+                                            "flow_tph":  4.08,
+                                            "depth_end":  null,
+                                            "variant_id":  "v1",
+                                            "depth_start":  null,
+                                            "end_node_id":  "1490",
+                                            "laying_method":  "base",
+                                            "start_node_id":  "1485",
+                                            "object_type":  "heat_network",
+                                            "id":  "p_v1_1485"
+                                        }
+                     },
+                     {
+                         "type":  "Feature",
+                         "geometry":  {
+                                          "type":  "LineString",
+                                          "coordinates":  [
+                                                              [
+                                                                  37.633139322,
+                                                                  55.698653068
+                                                              ],
+                                                              [
+                                                                  37.633243533,
+                                                                  55.6986993
+                                                              ],
+                                                              [
+                                                                  37.635333306,
+                                                                  55.698475132
+                                                              ],
+                                                              [
+                                                                  37.635417056,
+                                                                  55.698614732
+                                                              ],
+                                                              [
+                                                                  37.638461839,
+                                                                  55.697638533
+                                                              ]
+                                                          ]
+                                      },
+                         "properties":  {
+                                            "cost":  36820922.1,
+                                            "length":  378.52,
+                                            "diameter":  125,
+                                            "flow_tph":  40.0,
+                                            "depth_end":  null,
+                                            "variant_id":  "v1",
+                                            "depth_start":  null,
+                                            "end_node_id":  "1490",
+                                            "laying_method":  "base",
+                                            "start_node_id":  "1486",
+                                            "object_type":  "heat_network",
+                                            "id":  "p_v1_1486"
+                                        }
+                     },
+                     {
+                         "type":  "Feature",
+                         "geometry":  {
+                                          "type":  "LineString",
+                                          "coordinates":  [
+                                                              [
+                                                                  37.633752441,
+                                                                  55.697472329
+                                                              ],
+                                                              [
+                                                                  37.633466552,
+                                                                  55.697592124
+                                                              ],
+                                                              [
+                                                                  37.633656811,
+                                                                  55.697686393
+                                                              ],
+                                                              [
+                                                                  37.635082576,
+                                                                  55.698312476
+                                                              ],
+                                                              [
+                                                                  37.635333306,
+                                                                  55.698475132
+                                                              ],
+                                                              [
+                                                                  37.635417056,
+                                                                  55.698614732
+                                                              ],
+                                                              [
+                                                                  37.638461839,
+                                                                  55.697638533
+                                                              ]
+                                                          ]
+                                      },
+                         "properties":  {
+                                            "cost":  37003279.9,
+                                            "length":  412.3,
+                                            "diameter":  100,
+                                            "flow_tph":  19.73,
+                                            "depth_end":  null,
+                                            "variant_id":  "v1",
+                                            "depth_start":  null,
+                                            "end_node_id":  "1490",
+                                            "laying_method":  "base",
+                                            "start_node_id":  "1487",
+                                            "object_type":  "heat_network",
+                                            "id":  "p_v1_1487"
+                                        }
+                     },
+                     {
+                         "type":  "Feature",
+                         "geometry":  {
+                                          "type":  "LineString",
+                                          "coordinates":  [
+                                                              [
+                                                                  37.632034439,
+                                                                  55.69704569
+                                                              ],
+                                                              [
+                                                                  37.632446869,
+                                                                  55.697439356
+                                                              ],
+                                                              [
+                                                                  37.632765879,
+                                                                  55.697563709
+                                                              ],
+                                                              [
+                                                                  37.633870304,
+                                                                  55.698110419
+                                                              ],
+                                                              [
+                                                                  37.635333306,
+                                                                  55.698475132
+                                                              ],
+                                                              [
+                                                                  37.635417056,
+                                                                  55.698614732
+                                                              ],
+                                                              [
+                                                                  37.638461839,
+                                                                  55.697638533
+                                                              ]
+                                                          ]
+                                      },
+                         "properties":  {
+                                            "cost":  49085256.83,
+                                            "length":  504.6,
+                                            "diameter":  125,
+                                            "flow_tph":  31.89,
+                                            "depth_end":  null,
+                                            "variant_id":  "v1",
+                                            "depth_start":  null,
+                                            "end_node_id":  "1490",
+                                            "laying_method":  "base",
+                                            "start_node_id":  "1488",
+                                            "object_type":  "heat_network",
+                                            "id":  "p_v1_1488"
+                                        }
+                     },
+                     {
+                         "type":  "Feature",
+                         "geometry":  {
+                                          "type":  "LineString",
+                                          "coordinates":  [
+                                                              [
+                                                                  37.638280304,
+                                                                  55.697956786
+                                                              ],
+                                                              [
+                                                                  37.638461839,
+                                                                  55.697638533
+                                                              ]
+                                                          ]
+                                      },
+                         "properties":  {
+                                            "cost":  3620089.13,
+                                            "length":  37.22,
+                                            "diameter":  125,
+                                            "flow_tph":  27.82,
+                                            "depth_end":  null,
+                                            "variant_id":  "v1",
+                                            "depth_start":  null,
+                                            "end_node_id":  "1514",
+                                            "laying_method":  "base",
+                                            "start_node_id":  "1509",
+                                            "object_type":  "heat_network",
+                                            "id":  "p_v1_1509"
+                                        }
+                     },
+                     {
+                         "type":  "Feature",
+                         "geometry":  {
+                                          "type":  "LineString",
+                                          "coordinates":  [
+                                                              [
+                                                                  37.639538146,
+                                                                  55.696851829
+                                                              ],
+                                                              [
+                                                                  37.638240271,
+                                                                  55.69734639
+                                                              ]
+                                                          ]
+                                      },
+                         "properties":  {
+                                            "cost":  8832818.66,
+                                            "length":  98.42,
+                                            "diameter":  100,
+                                            "flow_tph":  20.63,
+                                            "depth_end":  null,
+                                            "variant_id":  "v1",
+                                            "depth_start":  null,
+                                            "end_node_id":  "1517",
+                                            "laying_method":  "base",
+                                            "start_node_id":  "1510",
+                                            "object_type":  "heat_network",
+                                            "id":  "p_v1_1510"
+                                        }
+                     },
+                     {
+                         "type":  "Feature",
+                         "geometry":  {
+                                          "type":  "Point",
+                                          "coordinates":  [
+                                                              37.638240271,
+                                                              55.69734639
+                                                          ]
+                                      },
+                         "properties":  {
+                                            "cost":  3000000.0,
+                                            "diameter":  100,
+                                            "variant_id":  "v1",
+                                            "object_type":  "heat_chamber",
+                                            "id":  "ch_1517"
+                                        }
+                     },
+                     {
+                         "type":  "Feature",
+                         "geometry":  null,
+                         "properties":  {
+                                            "rank":  2,
+                                            "score":  16.2108,
+                                            "variant_id":  "v1",
+                                            "calculated_cost":  288958037.18,
+                                            "construction_cost":  288958037.18,
+                                            "new_network_length":  2706.65,
+                                            "unconnected_oks_ids":  [
+
+                                                                    ],
+                                            "unconnected_penalty":  0.0,
+                                            "chamber_construction_cost":  3000000.0,
+                                            "existing_chamber_tie_in_cost":  15000000,
+                                            "existing_chamber_tie_in_count":  3,
+                                            "object_type":  "variant_summary",
+                                            "id":  "summary_v1"
+                                        }
+                     }
+                 ],
+    "type":  "FeatureCollection"
+}
