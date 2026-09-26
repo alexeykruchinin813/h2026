@@ -7,19 +7,15 @@ import org.springframework.core.io.ClassPathResource;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.mock.web.MockMultipartFile;
 
-import java.util.List;
-import java.util.Map;
-import java.util.UUID;
+import java.util.*;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
  * Интеграционный тест связности гибридного графа на конкурсном наборе данных (P0-4).
- *
  * Запускает полный production-пайплайн через {@link TaskService#submit}, дожидается завершения
  * и проверяет метрику связности: количество ОКС, имеющих хотя бы одно ребро
  * к "чужим" вершинам (escape, candidate или чужие polygon_corner).
- *
  * Цель P0: >= 10 из 17 ОКС.
  */
 @DisplayName("Интеграционный тест связности гибридного графа (P0-4)")
@@ -170,6 +166,19 @@ class HybridConnectivityIT extends BasePostgresIntegrationTest {
                     v.get("construction_cost"), v.get("new_network_length"));
         }
 
+        // ТЗ 2.8: «основной + до двух содержательно отличающихся». Дедупликация
+        // отсеивает идентичные, поэтому 1..3.
+        assertTrue(variants.size() >= 1 && variants.size() <= 3,
+                "ТЗ 2.8: 1–3 варианта, получено " + variants.size());
+
+        // Все варианты должны иметь уникальный score (после дедупликации)
+        Set<Double> scores = new HashSet<>();
+        for (Map<String, Object> v : variants) {
+            double s = Math.round(((Number) v.get("score")).doubleValue() * 10000.0) / 10000.0;
+            assertTrue(scores.add(s),
+                    "После дедупликации score должны быть уникальны, дубликат: " + s);
+        }
+
         // P3.1: на конкурсном наборе все OKS подключены → штраф 0, массив пуст
         for (Map<String, Object> v : variants) {
             Number penalty = (Number) v.get("unconnected_penalty");
@@ -179,15 +188,17 @@ class HybridConnectivityIT extends BasePostgresIntegrationTest {
             assertEquals(0.0, penalty.doubleValue(), 0.01,
                     "На конкурсном наборе все 17 OKS подключены → штраф 0");
         }
-
-        assertEquals(3, variants.size(), "ТЗ 2.8: должно быть 3 варианта");
+        // rank 1 = минимальный score, score монотонно растёт по rank.
+        // Проверяем без жёсткого обращения к get(2): после дедупликации
+        // вариантов может быть 1, 2 или 3 (ТЗ 2.8).
         assertEquals(1, ((Number) variants.get(0).get("rank")).intValue(),
                 "rank 1 должен быть у минимального score");
-        assertTrue(((Number) variants.get(0).get("score")).doubleValue()
-                        <= ((Number) variants.get(1).get("score")).doubleValue(),
-                "rank 1 должен иметь score <= rank 2");
-        assertTrue(((Number) variants.get(1).get("score")).doubleValue()
-                        <= ((Number) variants.get(2).get("score")).doubleValue(),
-                "rank 2 должен иметь score <= rank 3");
+        for (int i = 1; i < variants.size(); i++) {
+            double prev = ((Number) variants.get(i - 1).get("score")).doubleValue();
+            double cur  = ((Number) variants.get(i).get("score")).doubleValue();
+            assertTrue(prev <= cur,
+                    "Ранжирование нарушено: rank " + i + " score=" + prev +
+                            " > rank " + (i + 1) + " score=" + cur);
+        }
     }
 }
