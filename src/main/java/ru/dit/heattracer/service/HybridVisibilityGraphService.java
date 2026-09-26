@@ -153,23 +153,26 @@ public class HybridVisibilityGraphService {
      */
     private List<EdgeToValidate> extractEdgesForValidation(UUID taskId, int clusterId) {
         String sql = "SELECT ve.id, ve.source_vertex, ve.target_vertex, " +
-                     "       ST_AsBinary(ve.geom) AS geom_wkb, " +
-                     "       sv.own_polygon_id AS source_oks_id " +
-                     "FROM visibility_edge ve " +
-                     "JOIN visibility_vertex sv ON sv.id = ve.source_vertex " +
-                     "WHERE ve.task_id = ? AND ve.cluster_id = ?";
+                "       ST_AsBinary(ve.geom) AS geom_wkb, " +
+                "       sv.own_polygon_id AS source_oks_id, " +
+                "       tv.own_polygon_id AS target_oks_id " +
+                "FROM visibility_edge ve " +
+                "JOIN visibility_vertex sv ON sv.id = ve.source_vertex " +
+                "JOIN visibility_vertex tv ON tv.id = ve.target_vertex " +
+                "WHERE ve.task_id = ? AND ve.cluster_id = ?";
 
         return jdbc.query(sql, (rs, rowNum) -> {
             try {
                 byte[] wkb = rs.getBytes("geom_wkb");
                 Geometry geom = new WKBReader(geometryFactory).read(wkb);
-                
+
                 return new EdgeToValidate(
-                        rs.getLong("id"),
-                        rs.getLong("source_vertex"),
-                        rs.getLong("target_vertex"),
-                        geom,
-                        rs.getObject("source_oks_id") != null ? rs.getLong("source_oks_id") : null
+                    rs.getLong("id"),
+                    rs.getLong("source_vertex"),
+                    rs.getLong("target_vertex"),
+                    geom,
+                    rs.getObject("source_oks_id") != null ? rs.getLong("source_oks_id") : null,
+                    rs.getObject("target_oks_id") != null ? rs.getLong("target_oks_id") : null
                 );
             } catch (org.locationtech.jts.io.ParseException e) {
                 throw new RuntimeException("Failed to parse WKB geometry for edge", e);
@@ -299,12 +302,19 @@ public class HybridVisibilityGraphService {
             
             for (Long polygonId : candidates) {
                 RestrictionInfo info = polygons.get(polygonId);
-                
-                // Пропускаем собственный oks-полигон (U6 rule)
-                if ("oks".equals(info.type) && polygonId.equals(sourceOksId)) {
-                    continue;
+
+                // V40 U6 extended: пропускаем буфер source И target полигона ребра.
+                // Escape/corner_OKS рёбра, чьи концы лежат в своих OKS-полигонах,
+                // не должны отбраковываться собственным буфером (аналог V25-правила U6,
+                // но симметрично для обоих концов).
+                if ("oks".equals(info.type)) {
+                    boolean sameAsSource = polygonId.equals(edge.sourceOksId);
+                    boolean sameAsTarget = polygonId.equals(edge.targetOksId);
+                    if (sameAsSource || sameAsTarget) {
+                        continue;
+                    }
                 }
-                
+
                 PreparedGeometry preparedGeom = preparedGeometries.get(polygonId);
                 
                 // Проверяем пересечение
@@ -503,14 +513,15 @@ public class HybridVisibilityGraphService {
         final long targetVertex;
         final Geometry geom;
         final Long sourceOksId;
+        final Long targetOksId;
 
-        EdgeToValidate(long id, long sourceVertex, long targetVertex, 
-                       Geometry geom, Long sourceOksId) {
+        EdgeToValidate(long id, long sourceVertex, long targetVertex,
+                       Geometry geom, Long sourceOksId, Long targetOksId) {
             this.id = id;
             this.sourceVertex = sourceVertex;
             this.targetVertex = targetVertex;
             this.geom = geom;
             this.sourceOksId = sourceOksId;
+            this.targetOksId = targetOksId;
         }
-    }
-}
+    }}

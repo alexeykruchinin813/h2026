@@ -7,6 +7,8 @@ import org.springframework.core.io.ClassPathResource;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.mock.web.MockMultipartFile;
 
+import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -23,9 +25,9 @@ import static org.junit.jupiter.api.Assertions.*;
 @DisplayName("Интеграционный тест связности гибридного графа (P0-4)")
 class HybridConnectivityIT extends BasePostgresIntegrationTest {
 
-    private static final int P0_TARGET_CONNECTED = 10;
+    private static final int P0_TARGET_CONNECTED = 16;
     private static final String TEST_DATASET_RESOURCE = "first_dataset.geojson";
-    private static final long TIMEOUT_MS = 300_000; // 5 минут: escape-этап ~75с/кластер до оптимизации V33
+    private static final long TIMEOUT_MS = 180_000; // 5 минут: escape-этап ~75с/кластер до оптимизации V33
     private static final long POLL_INTERVAL_MS = 1_000;
 
     @Autowired
@@ -113,6 +115,13 @@ class HybridConnectivityIT extends BasePostgresIntegrationTest {
         System.out.printf("[P0-4 METRIC] Связность ОКС: %d из %d имеют рёбра к чужим вершинам. Всего рёбер: %d%n",
                 connectedOksCount, totalOksCount, totalEdges);
 
+        // WARN, но не FAIL: полная связность (17/17) — текущий факт, любой откат от неё фиксируем.
+        if (connectedOksCount < totalOksCount) {
+            System.out.printf("[P0-4 WARN] %d ОКС без рёбер к чужим вершинам — регресс от V34 (17/17). " +
+                            "Проверь escape_points и валидатор мостов.%n",
+                    totalOksCount - connectedOksCount);
+        }
+
         // 7. Проверка метрики P0
         int targetConnected = Math.min(P0_TARGET_CONNECTED, totalOksCount);
 
@@ -120,5 +129,54 @@ class HybridConnectivityIT extends BasePostgresIntegrationTest {
                 String.format("Недостаточная связность графа: только %d из %d ОКС имеют рёбра к чужим вершинам. " +
                                 "Цель P0: >= %d. Требуется tuning гибридного валидатора или escape points.",
                         connectedOksCount, totalOksCount, targetConnected));
+
+        // P1-1: пути A* по вариантам (V43: три варианта × N OKS)
+        List<Map<String, Object>> perVariant = jdbcTemplate.queryForList(
+                "SELECT variant_id, COUNT(DISTINCT oks_vertex_id) AS cnt " +
+                        "FROM path_result WHERE task_id = ? " +
+                        "GROUP BY variant_id ORDER BY variant_id",
+                taskId);
+
+        System.out.println("[P1-1 METRIC] OKS с найденным путём по вариантам:");
+        for (Map<String, Object> r : perVariant) {
+            System.out.printf("          %s : %s из %d%n",
+                    r.get("variant_id"), r.get("cnt"), totalOksCount);
+        }
+
+        // Минимум по всем вариантам — консервативный регрессионный барьер
+        int minWithPath = Integer.MAX_VALUE;
+        for (Map<String, Object> r : perVariant) {
+            minWithPath = Math.min(minWithPath, ((Number) r.get("cnt")).intValue());
+        }
+        if (perVariant.isEmpty()) minWithPath = 0;
+
+        int expectedMin = Math.min(16, totalOksCount);
+        assertTrue(minWithPath >= expectedMin,
+                String.format("Недостаточно OKS с путём (мин по вариантам): %d из %d (ожидали ≥ %d). " +
+                                "Проверь create_escape_points (V41) и findPathsFromOks (V21).",
+                        minWithPath, totalOksCount, expectedMin));
+
+        // ===== P2.2: три содержательно отличающихся варианта =====
+        List<Map<String, Object>> variants = jdbcTemplate.queryForList(
+                "SELECT id, rank, score, construction_cost, new_network_length " +
+                        "FROM variant WHERE task_id = ? ORDER BY rank",
+                taskId);
+
+        System.out.printf("[P2-2 METRIC] Вариантов: %d%n", variants.size());
+        for (Map<String, Object> v : variants) {
+            System.out.printf("          %s rank=%s score=%s cost=%s length=%s%n",
+                    v.get("id"), v.get("rank"), v.get("score"),
+                    v.get("construction_cost"), v.get("new_network_length"));
+        }
+
+        assertEquals(3, variants.size(), "ТЗ 2.8: должно быть 3 варианта");
+        assertEquals(1, ((Number) variants.get(0).get("rank")).intValue(),
+                "rank 1 должен быть у минимального score");
+        assertTrue(((Number) variants.get(0).get("score")).doubleValue()
+                        <= ((Number) variants.get(1).get("score")).doubleValue(),
+                "rank 1 должен иметь score <= rank 2");
+        assertTrue(((Number) variants.get(1).get("score")).doubleValue()
+                        <= ((Number) variants.get(2).get("score")).doubleValue(),
+                "rank 2 должен иметь score <= rank 3");
     }
 }
