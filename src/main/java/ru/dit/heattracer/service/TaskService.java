@@ -53,6 +53,10 @@ import java.util.concurrent.Executor;
  * </ul>
  * После построения — дедупликация по score (4 знака); на «чистом» наборе,
  * где все стратегии дают одну конфигурацию, в GeoJSON останется 1 вариант.
+ *
+ * <p>V63 (Проблема B): три стратегии capacity-aware. Распределение OKS по
+ * точкам врезки координируется через {@link TieInCoordinationService},
+ * чтобы degree existing_tie_in не превышал 4 (ТЗ 2.3, 2.4).
  */
 @Service
 public class TaskService {
@@ -76,6 +80,7 @@ public class TaskService {
     private final PathFinderService pathFinderService;
     private final DiameterPicker diameterPicker;
     private final RouteBuilderService routeBuilderService;
+    private final TieInCoordinationService tieInCoordinationService;
 
     public TaskService(
             @Qualifier("calcExecutor") Executor calcExecutor,
@@ -93,7 +98,8 @@ public class TaskService {
             HybridVisibilityGraphService hybridVisibilityGraphService,
             PathFinderService pathFinderService,
             DiameterPicker diameterPicker,
-            RouteBuilderService routeBuilderService
+            RouteBuilderService routeBuilderService,
+            TieInCoordinationService tieInCoordinationService
     ) throws IOException {
         this.calcExecutor = calcExecutor;
         this.storageRoot = Paths.get(storageDir);
@@ -111,6 +117,7 @@ public class TaskService {
         this.pathFinderService = pathFinderService;
         this.diameterPicker = diameterPicker;
         this.routeBuilderService = routeBuilderService;
+        this.tieInCoordinationService = tieInCoordinationService;
         Files.createDirectories(storageRoot);
         log.info("Storage root: {}", storageRoot.toAbsolutePath());
     }
@@ -290,44 +297,26 @@ public class TaskService {
                     }
                 }
 
-                // ===== Стратегия v1: individual =====
-                // Каждый OKS идёт в свой ближайший (min path cost) tie-in.
-                Map<Long, PathResult> v1 = new LinkedHashMap<>();
-                for (Map.Entry<Long, List<PathResult>> e : allPaths.entrySet()) {
-                    Long oks = e.getKey();
-                    List<PathResult> list = e.getValue();
-                    if (list.isEmpty()) continue;
-                    PathResult best = list.get(0);
-                    for (PathResult p : list) {
-                        if (p.getTotalCost() < best.getTotalCost()) best = p;
-                    }
-                    v1.put(oks, best);
-                }
+                // ===== V63: координация выбора точки врезки (Проблема B) =====
+                // Capacity(existing heat_chamber) = 4 − existing_attachments;
+                // capacity(new chamber) = 4. Greedy most-constrained-first.
+                Map<Long, Integer> baseCap = tieInCoordinationService.computeCapacities(id, allPaths);
 
-                // ===== Стратегия v2: shared =====
-                // Один общий target на весь кластер (min суммарная стоимость).
-                Long sharedTargetAll = pickSharedTarget(new HashSet<>(oksVertexIds), allPaths);
-                Map<Long, PathResult> v2 = new LinkedHashMap<>();
-                for (Map.Entry<Long, List<PathResult>> e : allPaths.entrySet()) {
-                    Long oks = e.getKey();
-                    PathResult chosen = null;
-                    if (sharedTargetAll != null) {
-                        for (PathResult p : e.getValue()) {
-                            if (p.getToVertex() == sharedTargetAll.longValue()) {
-                                chosen = p;
-                                break;
-                            }
-                        }
-                    }
-                    if (chosen == null) chosen = v1.get(oks);
-                    if (chosen != null) v2.put(oks, chosen);
-                }
+                // ===== Стратегия v1: individual (capacity-aware) =====
+                // Каждый OKS идёт в свой лучший по стоимости target с остатком capacity.
+                Map<Long, PathResult> v1 = tieInCoordinationService.assignIndividual(
+                        allPaths, new HashMap<>(baseCap));
 
-                // ===== Стратегия v3: sub-split =====
-                // Кластер делится на 2 подгруппы по X-координате, каждая со своим
-                // shared target. Содержательно отличается от v1/v2 (ТЗ 2.8:
-                // «разделение на несколько отдельных частей новой сети»).
-                Map<Long, PathResult> v3 = new LinkedHashMap<>();
+                // ===== Стратегия v2: shared (capacity-aware, хвост → individual) =====
+                // Группа OKS разделяет общий target; не влезшие — уходят в individual.
+                Map<Long, PathResult> v2 = tieInCoordinationService.assignShared(
+                        new HashSet<>(oksVertexIds), allPaths, new HashMap<>(baseCap));
+
+                // ===== Стратегия v3: sub-split (capacity-aware) =====
+                // Кластер делится на 2 подгруппы по X-координате, каждая
+                // проходит shared-назначение. Содержательно отличается от v1/v2
+                // (ТЗ 2.8: «разделение на несколько отдельных частей новой сети»).
+                Map<Long, PathResult> v3;
                 if (oksVertexIds.size() >= 4) {
                     Map<Long, Double> oksX = new HashMap<>();
                     jdbcTemplate.query(
@@ -335,34 +324,11 @@ public class TaskService {
                                     "WHERE task_id = ? AND cluster_id = ? AND vertex_type = 'oks'",
                             rs -> { oksX.put(rs.getLong("id"), rs.getDouble("x")); },
                             id, cluster.getClusterId());
-
-                    List<Long> sortedOks = new ArrayList<>(oksVertexIds);
-                    sortedOks.sort(Comparator.comparingDouble(oksX::get));
-
-                    int mid = sortedOks.size() / 2;
-                    Set<Long> groupA = new HashSet<>(sortedOks.subList(0, mid));
-                    Set<Long> groupB = new HashSet<>(sortedOks.subList(mid, sortedOks.size()));
-
-                    Long sharedA = pickSharedTarget(groupA, allPaths);
-                    Long sharedB = pickSharedTarget(groupB, allPaths);
-
-                    for (Long oks : oksVertexIds) {
-                        Long target = groupA.contains(oks) ? sharedA : sharedB;
-                        PathResult chosen = null;
-                        if (target != null) {
-                            for (PathResult p : allPaths.get(oks)) {
-                                if (p.getToVertex() == target.longValue()) {
-                                    chosen = p;
-                                    break;
-                                }
-                            }
-                        }
-                        if (chosen == null) chosen = v1.get(oks);
-                        if (chosen != null) v3.put(oks, chosen);
-                    }
+                    v3 = tieInCoordinationService.assignSubSplit(
+                            oksVertexIds, allPaths, new HashMap<>(baseCap), oksX);
                 } else {
                     // Малый кластер (< 4 OKS) — sub-split не имеет смысла, копия v1
-                    v3.putAll(v1);
+                    v3 = new LinkedHashMap<>(v1);
                 }
 
                 // Сохраняем все три стратегии (дедупликация — позже)
@@ -540,35 +506,8 @@ public class TaskService {
         }
     }
 
-    /**
-     * Выбирает shared target для группы OKS: target с максимальным покрытием,
-     * среди равных — с минимальной суммой path.cost.
-     * Возвращает null, если ни один target не достижим ни от одного OKS группы.
-     */
-    private Long pickSharedTarget(Set<Long> oksGroup, Map<Long, List<PathResult>> allPaths) {
-        Map<Long, Double> sumByTarget = new HashMap<>();
-        Map<Long, Integer> coverByTarget = new HashMap<>();
-        for (Long oks : oksGroup) {
-            List<PathResult> paths = allPaths.get(oks);
-            if (paths == null) continue;
-            for (PathResult p : paths) {
-                sumByTarget.merge(p.getToVertex(), p.getTotalCost(), Double::sum);
-                coverByTarget.merge(p.getToVertex(), 1, Integer::sum);
-            }
-        }
-        Long best = null;
-        double bestSum = Double.MAX_VALUE;
-        int bestCover = -1;
-        for (Map.Entry<Long, Double> e : sumByTarget.entrySet()) {
-            int cover = coverByTarget.getOrDefault(e.getKey(), 0);
-            if (cover > bestCover || (cover == bestCover && e.getValue() < bestSum)) {
-                best = e.getKey();
-                bestSum = e.getValue();
-                bestCover = cover;
-            }
-        }
-        return best;
-    }
+    // Метод pickSharedTarget удалён в V63: логика переехала в
+    // TieInCoordinationService.pickSharedTargetForGroup (capacity-aware).
 
     public Optional<TaskState> get(UUID id) {
         return Optional.ofNullable(tasks.get(id));
