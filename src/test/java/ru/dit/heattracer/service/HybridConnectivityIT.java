@@ -374,6 +374,92 @@ class HybridConnectivityIT extends BasePostgresIntegrationTest {
                     .append(r.get("node_type")).append(", degree=")
                     .append(r.get("degree")).append("\n"));
 
+// 7b. SQL A: конкретная пересекающаяся пара при bad_crossings > 0.
+            try {
+                List<Map<String,Object>> crossPairs = jdbcTemplate.queryForList(
+                        "SELECT a.id AS aid, ROUND(a.length_m::numeric,2) AS a_len, a.diameter AS a_diam, " +
+                                "       a.start_node_id AS a_start, a.end_node_id AS a_end, " +
+                                "       asn.node_type AS a_start_type, aen.node_type AS a_end_type, " +
+                                "       asn.ref_id    AS a_start_ref,  aen.ref_id    AS a_end_ref, " +
+                                "       b.id AS bid, ROUND(b.length_m::numeric,2) AS b_len, b.diameter AS b_diam, " +
+                                "       b.start_node_id AS b_start, b.end_node_id AS b_end, " +
+                                "       bsn.node_type AS b_start_type, ben.node_type AS b_end_type, " +
+                                "       bsn.ref_id    AS b_start_ref,  ben.ref_id    AS b_end_ref, " +
+                                "       ST_GeometryType(ST_Intersection(a.geom, b.geom)) AS cross_type, " +
+                                "       ST_AsText(ST_Intersection(a.geom, b.geom)) AS cross_geom " +
+                                "FROM physical_segment a " +
+                                "JOIN physical_segment b ON a.task_id = b.task_id " +
+                                "  AND a.variant_id = b.variant_id AND a.id < b.id " +
+                                "LEFT JOIN physical_node asn ON asn.id = a.start_node_id " +
+                                "LEFT JOIN physical_node aen ON aen.id = a.end_node_id " +
+                                "LEFT JOIN physical_node bsn ON bsn.id = b.start_node_id " +
+                                "LEFT JOIN physical_node ben ON ben.id = b.end_node_id " +
+                                "WHERE a.task_id = ? AND a.variant_id = 'v1' " +
+                                "  AND ST_Intersects(a.geom, b.geom) AND NOT ST_Touches(a.geom, b.geom)",
+                        currentTaskId);
+                sb.append("[sqlA v1] crossing_pairs=").append(crossPairs.size()).append("\n");
+                for (Map<String,Object> r : crossPairs) {
+                    sb.append("    A=").append(r.get("aid"))
+                            .append(" len=").append(r.get("a_len")).append(" diam=").append(r.get("a_diam"))
+                            .append(" start=").append(r.get("a_start")).append("/").append(r.get("a_start_type")).append("/").append(r.get("a_start_ref"))
+                            .append(" end=").append(r.get("a_end")).append("/").append(r.get("a_end_type")).append("/").append(r.get("a_end_ref"))
+                            .append("\n");
+                    sb.append("    B=").append(r.get("bid"))
+                            .append(" len=").append(r.get("b_len")).append(" diam=").append(r.get("b_diam"))
+                            .append(" start=").append(r.get("b_start")).append("/").append(r.get("b_start_type")).append("/").append(r.get("b_start_ref"))
+                            .append(" end=").append(r.get("b_end")).append("/").append(r.get("b_end_type")).append("/").append(r.get("b_end_ref"))
+                            .append("\n");
+                    sb.append("    cross_type=").append(r.get("cross_type"))
+                            .append(" cross_geom=").append(r.get("cross_geom")).append("\n");
+                }
+            } catch (Exception e) {
+                sb.append("[sqlA_error] ").append(e.getMessage()).append("\n");
+            }
+
+            // 7c. SQL B: происхождение existing_tie_in с degree > 4.
+            try {
+                List<Map<String,Object>> tieInHi = jdbcTemplate.queryForList(
+                        "SELECT pn.id, pn.ref_id, pn.degree, pn.node_type, " +
+                                "       (SELECT COUNT(*) FROM physical_segment ps " +
+                                "         WHERE ps.task_id = pn.task_id AND ps.variant_id = pn.variant_id " +
+                                "           AND (ps.start_node_id = pn.id OR ps.end_node_id = pn.id)) AS actual_degree, " +
+                                "       (SELECT COUNT(*) FROM input_feature f " +
+                                "         WHERE f.task_id = pn.task_id AND f.feature_id::text = pn.ref_id " +
+                                "           AND f.object_type = 'heat_chamber') AS is_input_chamber, " +
+                                "       (SELECT COUNT(DISTINCT pr.oks_vertex_id) FROM path_result pr " +
+                                "         JOIN visibility_vertex vv ON vv.id = pr.target_vertex_id " +
+                                "         WHERE pr.task_id = pn.task_id AND pr.variant_id = pn.variant_id " +
+                                "           AND vv.ref_id::text = pn.ref_id) AS oks_paths_ending_here, " +
+                                "       (SELECT array_agg(DISTINCT pn2.node_type) FROM physical_segment ps " +
+                                "         JOIN physical_node pn2 " +
+                                "           ON pn2.id = CASE WHEN ps.start_node_id = pn.id THEN ps.end_node_id ELSE ps.start_node_id END " +
+                                "         WHERE ps.task_id = pn.task_id AND ps.variant_id = pn.variant_id " +
+                                "           AND (ps.start_node_id = pn.id OR ps.end_node_id = pn.id)) AS neighbor_types, " +
+                                "       (SELECT COUNT(*) FROM physical_node pn3 " +
+                                "         WHERE pn3.task_id = pn.task_id AND pn3.variant_id = pn.variant_id " +
+                                "           AND pn3.ref_id LIKE 'split_%') AS split_created_nodes " +
+                                "FROM physical_node pn " +
+                                "WHERE pn.task_id = ? AND pn.variant_id = 'v1' " +
+                                "  AND pn.degree > 4 " +
+                                "  AND pn.node_type IN ('branch_chamber','new_terminal_chamber','existing_tie_in')",
+                        currentTaskId);
+                sb.append("[sqlB v1] high_degree_nodes=").append(tieInHi.size()).append("\n");
+                for (Map<String,Object> r : tieInHi) {
+                    sb.append("    id=").append(r.get("id"))
+                            .append(" ref=").append(r.get("ref_id"))
+                            .append(" type=").append(r.get("node_type"))
+                            .append(" degree=").append(r.get("degree"))
+                            .append(" actual=").append(r.get("actual_degree"))
+                            .append(" is_input_chamber=").append(r.get("is_input_chamber"))
+                            .append(" oks_paths_ending_here=").append(r.get("oks_paths_ending_here"))
+                            .append(" split_created_nodes=").append(r.get("split_created_nodes"))
+                            .append(" neighbor_types=").append(r.get("neighbors"))
+                            .append("\n");
+                }
+            } catch (Exception e) {
+                sb.append("[sqlB_error] ").append(e.getMessage()).append("\n");
+            }
+
             // 8. aggregated_segments.
             Long agg = jdbcTemplate.queryForObject(
                     "SELECT count(*) FROM physical_segment s " +
