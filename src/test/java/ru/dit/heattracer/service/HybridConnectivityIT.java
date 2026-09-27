@@ -11,6 +11,9 @@ import java.util.*;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.TestInfo;
+
 /**
  * Интеграционный тест связности гибридного графа на конкурсном наборе данных (P0-4).
  * Запускает полный production-пайплайн через {@link TaskService#submit}, дожидается
@@ -49,6 +52,7 @@ class HybridConnectivityIT extends BasePostgresIntegrationTest {
 
         // 2. Запуск асинхронного пайплайна
         UUID taskId = taskService.submit(file);
+        this.currentTaskId = taskId;
         assertNotNull(taskId, "submit() должен вернуть UUID задачи");
 
         // 3. Ожидание завершения задачи (polling).
@@ -285,4 +289,132 @@ class HybridConnectivityIT extends BasePostgresIntegrationTest {
                         "bad_crossings=%d, degree_gt_4=%d, aggregated_segments=%d%n",
                 segCount, nodeCount, badCrossings, overDeg.size(), aggregatedSegments);
     }
+
+    // V58: диагностический вывод — всегда, для отладки упавших прогонов.
+    private UUID currentTaskId;
+
+    @AfterEach
+    void printDiagnostics(TestInfo testInfo) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("\n=== DIAGNOSTICS BEGIN taskId=")
+                .append(currentTaskId).append(" status=")
+                .append(testInfo.getTags()).append(" ===\n");
+
+        try {
+            // 1. Flyway.
+            jdbcTemplate.queryForList(
+                            "SELECT version, description FROM flyway_schema_history ORDER BY version DESC LIMIT 5")
+                    .forEach(r -> sb.append("[flyway] ")
+                            .append(r.get("version")).append(" | ")
+                            .append(r.get("description")).append("\n"));
+
+            if (currentTaskId == null) {
+                sb.append("[task] taskId not set — тест упал до submit\n");
+                sb.append("=== DIAGNOSTICS END ===\n");
+                System.out.println(sb);
+                return;
+            }
+
+            // 2. Task status.
+            jdbcTemplate.queryForList(
+                            "SELECT status, stage, error_message FROM task WHERE id = ?", currentTaskId)
+                    .forEach(r -> sb.append("[task] status=").append(r.get("status"))
+                            .append(", stage=").append(r.get("stage"))
+                            .append(", error=").append(r.get("error_message")).append("\n"));
+
+            // 3. path_result.
+            jdbcTemplate.queryForList(
+                    "SELECT variant_id, COUNT(DISTINCT oks_vertex_id) AS cnt " +
+                            "FROM path_result WHERE task_id = ? GROUP BY variant_id ORDER BY variant_id",
+                    currentTaskId).forEach(r -> sb.append("[paths] ")
+                    .append(r.get("variant_id")).append("=")
+                    .append(r.get("cnt")).append("\n"));
+
+            // 4. physical_segment (только v1).
+            jdbcTemplate.queryForList(
+                            "SELECT COUNT(*) AS n, " +
+                                    "       COUNT(*) FILTER (WHERE diameter IS NULL) AS null_diam, " +
+                                    "       ROUND(MIN(ST_Length(geom))::numeric, 2) AS min_len, " +
+                                    "       ROUND(MAX(ST_Length(geom))::numeric, 2) AS max_len " +
+                                    "FROM physical_segment WHERE task_id = ? AND variant_id = 'v1'",
+                            currentTaskId)
+                    .forEach(r -> sb.append("[physical_segment v1] n=").append(r.get("n"))
+                            .append(", null_diam=").append(r.get("null_diam"))
+                            .append(", len=[").append(r.get("min_len"))
+                            .append("..").append(r.get("max_len")).append("]\n"));
+
+            // 5. physical_node по типам (только v1).
+            jdbcTemplate.queryForList(
+                            "SELECT node_type, COUNT(*) AS n, MAX(degree) AS max_deg " +
+                                    "FROM physical_node WHERE task_id = ? AND variant_id = 'v1' " +
+                                    "GROUP BY node_type ORDER BY node_type",
+                            currentTaskId)
+                    .forEach(r -> sb.append("[physical_node v1] ")
+                            .append(r.get("node_type")).append(": n=")
+                            .append(r.get("n")).append(", max_degree=")
+                            .append(r.get("max_deg")).append("\n"));
+
+            // 6. bad_crossings (только v1).
+            Long badCrossings = jdbcTemplate.queryForObject(
+                    "SELECT count(*) FROM physical_segment a " +
+                            "JOIN physical_segment b ON a.task_id = b.task_id " +
+                            "  AND a.variant_id = b.variant_id AND a.id < b.id " +
+                            "WHERE a.task_id = ? AND a.variant_id = 'v1' AND ST_Intersects(a.geom, b.geom) " +
+                            "  AND NOT ST_Touches(a.geom, b.geom)",
+                    Long.class, currentTaskId);
+            sb.append("[metric v1] bad_crossings=").append(badCrossings).append("\n");
+
+            // 7. degree > 4 (только v1).
+            List<Map<String,Object>> overDeg = jdbcTemplate.queryForList(
+                    "SELECT id, node_type, degree FROM physical_node " +
+                            "WHERE task_id = ? AND variant_id = 'v1' AND degree > 4", currentTaskId);
+            sb.append("[metric v1] degree_gt_4=").append(overDeg.size()).append("\n");
+            overDeg.forEach(r -> sb.append("    node id=")
+                    .append(r.get("id")).append(", type=")
+                    .append(r.get("node_type")).append(", degree=")
+                    .append(r.get("degree")).append("\n"));
+
+            // 8. aggregated_segments.
+            Long agg = jdbcTemplate.queryForObject(
+                    "SELECT count(*) FROM physical_segment s " +
+                            "WHERE s.task_id = ? AND s.variant_id = 'v1' AND s.flow_tph > " +
+                            "  (SELECT MAX((f.properties->>'flow_tph')::double precision) " +
+                            "   FROM input_feature f WHERE f.task_id = ? AND f.object_type = 'oks_connection_point')",
+                    Long.class, currentTaskId, currentTaskId);
+            sb.append("[metric] aggregated_segments=").append(agg).append("\n");
+
+            // 9. variant summary.
+            jdbcTemplate.queryForList(
+                            "SELECT id, rank, ROUND(score::numeric, 4) AS score, " +
+                                    "       ROUND(construction_cost::numeric, 0) AS cost, " +
+                                    "       ROUND(new_network_length::numeric, 1) AS len, " +
+                                    "       unconnected_penalty " +
+                                    "FROM variant WHERE task_id = ? ORDER BY rank", currentTaskId)
+                    .forEach(r -> sb.append("[variant] ").append(r.get("id"))
+                            .append(" rank=").append(r.get("rank"))
+                            .append(" score=").append(r.get("score"))
+                            .append(" cost=").append(r.get("cost"))
+                            .append(" len=").append(r.get("len"))
+                            .append(" unconn_penalty=").append(r.get("unconnected_penalty"))
+                            .append("\n"));
+
+            // 10. Top-5 сегментов по flow.
+            jdbcTemplate.queryForList(
+                            "SELECT id, ROUND(flow_tph::numeric, 2) AS flow, diameter, " +
+                                    "       ROUND(ST_Length(geom)::numeric, 2) AS len " +
+                                    "FROM physical_segment WHERE task_id = ? AND variant_id = 'v1' " +
+                                    "ORDER BY flow_tph DESC LIMIT 5", currentTaskId)
+                    .forEach(r -> sb.append("[top_flow] seg=").append(r.get("id"))
+                            .append(" flow=").append(r.get("flow"))
+                            .append(" diam=").append(r.get("diameter"))
+                            .append(" len=").append(r.get("len")).append("\n"));
+
+        } catch (Exception e) {
+            sb.append("[diag_error] ").append(e.getMessage()).append("\n");
+        }
+
+        sb.append("=== DIAGNOSTICS END ===\n");
+        System.out.println(sb);
+    }
+
 }
