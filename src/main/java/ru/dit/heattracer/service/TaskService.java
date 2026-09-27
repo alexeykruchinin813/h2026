@@ -274,6 +274,19 @@ public class TaskService {
             int totalPaths = 0;
             int totalOksWithoutPath = 0;
 
+            // V64: собираем пути ВСЕХ кластеров до начала координации.
+            class ClusterPaths {
+                final OksCluster cluster;
+                final List<Long> oksVertexIds;
+                final Map<Long, List<PathResult>> allPaths;
+                ClusterPaths(OksCluster c, List<Long> ids, Map<Long, List<PathResult>> p) {
+                    this.cluster = c; this.oksVertexIds = ids; this.allPaths = p;
+                }
+            }
+
+            List<ClusterPaths> clusterPathsList = new ArrayList<>();
+            Set<Long> allTargetVertexIds = new HashSet<>();
+
             for (OksCluster cluster : clusters) {
                 List<Long> oksVertexIds = jdbcTemplate.queryForList(
                         "SELECT id FROM visibility_vertex " +
@@ -281,59 +294,49 @@ public class TaskService {
                                 " ORDER BY id",
                         Long.class, id, cluster.getClusterId());
 
-                log.info("[{}] Cluster {}: {} OKS vertices",
-                        id, cluster.getClusterId(), oksVertexIds.size());
+                log.info("[{}] Cluster {}: {} OKS vertices", id, cluster.getClusterId(), oksVertexIds.size());
 
-                // P2.2: собираем все пути от каждого OKS
                 Map<Long, List<PathResult>> allPaths = new LinkedHashMap<>();
                 for (Long oksVertex : oksVertexIds) {
-                    List<PathResult> list = pathFinderService.findPathsFromOks(
-                            id, cluster.getClusterId(), oksVertex);
+                    List<PathResult> list = pathFinderService.findPathsFromOks(id, cluster.getClusterId(), oksVertex);
                     allPaths.put(oksVertex, list);
-                    log.info("[{}]   OKS {} → {} reachable candidates",
-                            id, oksVertex, list.size());
-                    if (list.isEmpty()) {
-                        totalOksWithoutPath++;
-                    }
+                    log.info("[{}]   OKS {} → {} reachable candidates", id, oksVertex, list.size());
+                    if (list.isEmpty()) totalOksWithoutPath++;
+                    for (PathResult p : list) allTargetVertexIds.add(p.getToVertex());
                 }
+                clusterPathsList.add(new ClusterPaths(cluster, oksVertexIds, allPaths));
+            }
 
-                // ===== V63: координация выбора точки врезки (Проблема B) =====
-                // Capacity(existing heat_chamber) = 4 − existing_attachments;
-                // capacity(new chamber) = 4. Greedy most-constrained-first.
-                Map<Long, Integer> baseCap = tieInCoordinationService.computeCapacities(id, allPaths);
+            // V64: одна capacity-карта на вариант, общая для всех кластеров.
+            TieInCoordinationService.CapacityState baseCap =
+                    tieInCoordinationService.computeCapacities(id, allTargetVertexIds);
 
-                // ===== Стратегия v1: individual (capacity-aware) =====
-                // Каждый OKS идёт в свой лучший по стоимости target с остатком capacity.
-                Map<Long, PathResult> v1 = tieInCoordinationService.assignIndividual(
-                        allPaths, new HashMap<>(baseCap));
+            TieInCoordinationService.CapacityState capV1 = baseCap.copy();
+            TieInCoordinationService.CapacityState capV2 = baseCap.copy();
+            TieInCoordinationService.CapacityState capV3 = baseCap.copy();
 
-                // ===== Стратегия v2: shared (capacity-aware, хвост → individual) =====
-                // Группа OKS разделяет общий target; не влезшие — уходят в individual.
+            // Второй проход: назначаем с общей capacity-картой на вариант.
+            for (ClusterPaths cp : clusterPathsList) {
+                Map<Long, PathResult> v1 = tieInCoordinationService.assignIndividual(cp.allPaths, capV1);
+
                 Map<Long, PathResult> v2 = tieInCoordinationService.assignShared(
-                        new HashSet<>(oksVertexIds), allPaths, new HashMap<>(baseCap));
+                        new HashSet<>(cp.oksVertexIds), cp.allPaths, capV2);
 
-                // ===== Стратегия v3: sub-split (capacity-aware) =====
-                // Кластер делится на 2 подгруппы по X-координате, каждая
-                // проходит shared-назначение. Содержательно отличается от v1/v2
-                // (ТЗ 2.8: «разделение на несколько отдельных частей новой сети»).
                 Map<Long, PathResult> v3;
-                if (oksVertexIds.size() >= 4) {
+                if (cp.oksVertexIds.size() >= 4) {
                     Map<Long, Double> oksX = new HashMap<>();
                     jdbcTemplate.query(
                             "SELECT id, ST_X(geom) AS x FROM visibility_vertex " +
                                     "WHERE task_id = ? AND cluster_id = ? AND vertex_type = 'oks'",
                             rs -> { oksX.put(rs.getLong("id"), rs.getDouble("x")); },
-                            id, cluster.getClusterId());
-                    v3 = tieInCoordinationService.assignSubSplit(
-                            oksVertexIds, allPaths, new HashMap<>(baseCap), oksX);
+                            id, cp.cluster.getClusterId());
+                    v3 = tieInCoordinationService.assignSubSplit(cp.oksVertexIds, cp.allPaths, capV3, oksX);
                 } else {
-                    // Малый кластер (< 4 OKS) — sub-split не имеет смысла, копия v1
                     v3 = new LinkedHashMap<>(v1);
                 }
 
-                // Сохраняем все три стратегии (дедупликация — позже)
-                int clusterId = cluster.getClusterId();
-                for (Long oks : oksVertexIds) {
+                int clusterId = cp.cluster.getClusterId();
+                for (Long oks : cp.oksVertexIds) {
                     if (v1.containsKey(oks)) savePath(id, "v1", clusterId, oks, v1.get(oks));
                     if (v2.containsKey(oks)) savePath(id, "v2", clusterId, oks, v2.get(oks));
                     if (v3.containsKey(oks)) savePath(id, "v3", clusterId, oks, v3.get(oks));
@@ -341,12 +344,10 @@ public class TaskService {
                 totalPaths += v1.size();
             }
 
-            log.info("[{}] Total paths found: {}, OKS without path: {}",
-                    id, totalPaths, totalOksWithoutPath);
+            log.info("[{}] Total paths found: {}, OKS without path: {}", id, totalPaths, totalOksWithoutPath);
 
             int oksTotal = totalPaths + totalOksWithoutPath;
-            System.out.printf("[P1-1 METRIC] ОКС с найденным путём: %d из %d%n",
-                    totalPaths, oksTotal);
+            System.out.printf("[P1-1 METRIC] ОКС с найденным путём: %d из %d%n", totalPaths, oksTotal);
 
             state.setPercent(92);
             state.setStage("PATHS_FOUND");

@@ -495,6 +495,25 @@ class HybridConnectivityIT extends BasePostgresIntegrationTest {
                             .append(" diam=").append(r.get("diameter"))
                             .append(" len=").append(r.get("len")).append("\n"));
 
+            // 11.  cross-candidate
+            try {
+                List<Map<String,Object>> candidatesByRef = jdbcTemplate.queryForList(
+                        "SELECT vv.ref_id, COUNT(*) AS candidate_count " +
+                                "FROM visibility_vertex vv " +
+                                "JOIN input_feature f ON f.task_id = vv.task_id " +
+                                "  AND f.feature_id::text = vv.ref_id AND f.object_type = 'heat_chamber' " +
+                                "WHERE vv.task_id = ? AND vv.vertex_type = 'candidate' " +
+                                "GROUP BY vv.ref_id HAVING COUNT(*) > 1",
+                        currentTaskId);
+                sb.append("[candidates_by_ref] multi_candidate_chambers=")
+                        .append(candidatesByRef.size()).append("\n");
+                candidatesByRef.forEach(r -> sb.append("    ref=")
+                        .append(r.get("ref_id")).append(" candidates=")
+                        .append(r.get("candidate_count")).append("\n"));
+            } catch (Exception e) {
+                sb.append("[candidates_by_ref_error] ").append(e.getMessage()).append("\n");
+            }
+
         } catch (Exception e) {
             sb.append("[diag_error] ").append(e.getMessage()).append("\n");
         }
