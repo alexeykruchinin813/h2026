@@ -26,17 +26,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Comparator;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
-import java.util.Set;
-import java.util.UUID;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 
@@ -317,11 +307,20 @@ public class TaskService {
 
             // Второй проход: назначаем с общей capacity-картой на вариант.
             for (ClusterPaths cp : clusterPathsList) {
-                Map<Long, PathResult> v1 = tieInCoordinationService.assignIndividual(cp.allPaths, capV1);
+                // v1: чистый SSP
+                Map<Long, PathResult> v1 = tieInCoordinationService.assignIndividual(
+                        cp.allPaths, capV1);
 
-                Map<Long, PathResult> v2 = tieInCoordinationService.assignShared(
+                // v2: один shared target для всего кластера
+                Long sharedAll = tieInCoordinationService.pickSharedTarget(
                         new HashSet<>(cp.oksVertexIds), cp.allPaths, capV2);
+                Set<Long> preferredV2 = sharedAll == null
+                        ? Collections.emptySet()
+                        : Collections.singleton(sharedAll);
+                Map<Long, PathResult> v2 = tieInCoordinationService.assignShared(
+                        new HashSet<>(cp.oksVertexIds), cp.allPaths, capV2, preferredV2);
 
+                // v3: два shared target (sub-split по X)
                 Map<Long, PathResult> v3;
                 if (cp.oksVertexIds.size() >= 4) {
                     Map<Long, Double> oksX = new HashMap<>();
@@ -330,7 +329,21 @@ public class TaskService {
                                     "WHERE task_id = ? AND cluster_id = ? AND vertex_type = 'oks'",
                             rs -> { oksX.put(rs.getLong("id"), rs.getDouble("x")); },
                             id, cp.cluster.getClusterId());
-                    v3 = tieInCoordinationService.assignSubSplit(cp.oksVertexIds, cp.allPaths, capV3, oksX);
+
+                    List<Long> sorted = new ArrayList<>(cp.oksVertexIds);
+                    sorted.sort(Comparator.comparingDouble(oksX::get));
+                    int mid = sorted.size() / 2;
+                    Set<Long> groupA = new HashSet<>(sorted.subList(0, mid));
+                    Set<Long> groupB = new HashSet<>(sorted.subList(mid, sorted.size()));
+
+                    Long sharedA = tieInCoordinationService.pickSharedTarget(groupA, cp.allPaths, capV3);
+                    Long sharedB = tieInCoordinationService.pickSharedTarget(groupB, cp.allPaths, capV3);
+                    Set<Long> preferredV3 = new HashSet<>();
+                    if (sharedA != null) preferredV3.add(sharedA);
+                    if (sharedB != null && !sharedB.equals(sharedA)) preferredV3.add(sharedB);
+
+                    v3 = tieInCoordinationService.assignSubSplit(
+                            cp.oksVertexIds, cp.allPaths, capV3, oksX, preferredV3);
                 } else {
                     v3 = new LinkedHashMap<>(v1);
                 }
@@ -344,10 +357,14 @@ public class TaskService {
                 totalPaths += v1.size();
             }
 
-            log.info("[{}] Total paths found: {}, OKS without path: {}", id, totalPaths, totalOksWithoutPath);
+            int totalOksInClusters = clusterPathsList.stream()
+                    .mapToInt(cp -> cp.oksVertexIds.size()).sum();
+            int totalDropped = totalOksInClusters - totalPaths;
 
-            int oksTotal = totalPaths + totalOksWithoutPath;
-            System.out.printf("[P1-1 METRIC] ОКС с найденным путём: %d из %d%n", totalPaths, oksTotal);
+            log.info("[{}] OKS total={}, assigned={}, dropped_by_coordination={}, no_path={}",
+                    id, totalOksInClusters, totalPaths, totalDropped, totalOksWithoutPath);
+            System.out.printf("[P1-1 METRIC] ОКС с путём: %d из %d (dropped=%d, no_path=%d)%n",
+                    totalPaths, totalOksInClusters, totalDropped, totalOksWithoutPath);
 
             state.setPercent(92);
             state.setStage("PATHS_FOUND");

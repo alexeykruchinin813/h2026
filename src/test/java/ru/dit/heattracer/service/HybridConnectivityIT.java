@@ -469,6 +469,22 @@ class HybridConnectivityIT extends BasePostgresIntegrationTest {
                     Long.class, currentTaskId, currentTaskId);
             sb.append("[metric] aggregated_segments=").append(agg).append("\n");
 
+            // 8b. V64.3: unconnected OKS по вариантам.
+            try {
+                List<Map<String,Object>> unconn = jdbcTemplate.queryForList(
+                        "SELECT id, unconnected_oks_ids, unconnected_penalty " +
+                                "FROM variant WHERE task_id = ? ORDER BY id",
+                        currentTaskId);
+                sb.append("[unconnected] variants=").append(unconn.size()).append("\n");
+                unconn.forEach(r -> sb.append("    variant=")
+                        .append(r.get("id"))
+                        .append(" penalty=").append(r.get("unconnected_penalty"))
+                        .append(" ids=").append(r.get("unconnected_oks_ids"))
+                        .append("\n"));
+            } catch (Exception e) {
+                sb.append("[unconnected_error] ").append(e.getMessage()).append("\n");
+            }
+
             // 9. variant summary.
             jdbcTemplate.queryForList(
                             "SELECT id, rank, ROUND(score::numeric, 4) AS score, " +

@@ -11,19 +11,15 @@ import java.util.*;
 /**
  * Координация выбора точки врезки (Проблема B).
  *
- * <p>V64: фикс утечек capacity, обнаруженных в V63:
+ * <p>V64.4:
  * <ul>
- *   <li>cross-cluster: {@code computeCapacities} теперь вызывается ОДИН раз на вариант,
- *       а не на каждый кластер. {@link CapacityState} живёт в масштабе всей задачи+варианта.</li>
- *   <li>cross-candidate: capacity группируется по {@code ref_id} для существующих камер.
- *       Все кандидаты, указывающие на одну камеру, делят одну общую capacity.</li>
- * </ul>
- *
- * <p>Гарантии:
- * <ul>
- *   <li>∀ существующая камера c: {@code existing_attachments(c) + #OKS(c) ≤ 4};</li>
- *   <li>∀ новый target: {@code #OKS ≤ 4};</li>
- *   <li>OKS без допустимого target → unconnected (штраф по ТЗ 6).</li>
+ *   <li>assignShared больше не greedy — вызывается SSP с cost-shift
+ *       к preferred target'ам. Это устраняет suboptimality, которая
+ *       давала 13/17 в v2/v3 при работающем SSP в v1.</li>
+ *   <li>computeCapacities группирует edge projections по геометрии
+ *       (ST_SnapToGrid 0.01 м). Раньше разные target_vertex с одной
+ *       геометрией считались независимыми группами, что давало
+ *       degree &gt; 4 после физической сборки.</li>
  * </ul>
  */
 @Service
@@ -31,6 +27,8 @@ public class TieInCoordinationService {
 
     private static final Logger log = LoggerFactory.getLogger(TieInCoordinationService.class);
     private static final int MAX_ATTACHMENTS = 4;
+    private static final long COST_SCALE = 1000L;
+    private static final double COST_SHIFT_FACTOR = 0.1;
 
     private final JdbcTemplate jdbc;
 
@@ -39,7 +37,7 @@ public class TieInCoordinationService {
     }
 
     // ==========================================================================
-    // CapacityState
+    // CapacityState — без изменений
     // ==========================================================================
 
     public static class CapacityState {
@@ -68,14 +66,12 @@ public class TieInCoordinationService {
         }
 
         public CapacityState copy() {
-            return new CapacityState(
-                    new HashMap<>(targetToGroup),
-                    new HashMap<>(remaining));
+            return new CapacityState(new HashMap<>(targetToGroup), new HashMap<>(remaining));
         }
     }
 
     // ==========================================================================
-    // computeCapacities
+    // computeCapacities — теперь с группировкой по геометрии
     // ==========================================================================
 
     public CapacityState computeCapacities(UUID taskId, Set<Long> allTargetVertexIds) {
@@ -88,11 +84,14 @@ public class TieInCoordinationService {
 
         Long[] targetArr = allTargetVertexIds.toArray(new Long[0]);
 
+        // Собираем: id, ref_id, is_real_chamber, geom_hash (снап 0.01 м).
         Map<Long, String> targetRefId = new HashMap<>();
         Map<Long, Boolean> targetIsRealChamber = new HashMap<>();
+        Map<Long, String> targetGeomHash = new HashMap<>();
 
         jdbc.query(
                 "SELECT vv.id AS target_vertex_id, vv.ref_id, " +
+                        "       ST_AsText(ST_SnapToGrid(vv.geom, 0.01)) AS geom_hash, " +
                         "       EXISTS ( " +
                         "         SELECT 1 FROM input_feature f " +
                         "         WHERE f.task_id = ? " +
@@ -103,25 +102,33 @@ public class TieInCoordinationService {
                         "WHERE vv.id = ANY (?)",
                 rs -> {
                     long target = rs.getLong("target_vertex_id");
-                    String refId = rs.getString("ref_id");
-                    boolean isReal = rs.getBoolean("is_real_chamber");
-                    targetRefId.put(target, refId);
-                    targetIsRealChamber.put(target, isReal);
+                    targetRefId.put(target, rs.getString("ref_id"));
+                    targetIsRealChamber.put(target, rs.getBoolean("is_real_chamber"));
+                    targetGeomHash.put(target, rs.getString("geom_hash"));
                 },
                 taskId, targetArr);
 
+        // Группировка: real-chamber → по ref_id; edge projection → по геометрии.
         Map<String, Long> refIdToGroup = new HashMap<>();
+        Map<String, Long> geomHashToGroup = new HashMap<>();
+
         for (Long t : allTargetVertexIds) {
             boolean isReal = targetIsRealChamber.getOrDefault(t, false);
             String refId = targetRefId.get(t);
+            String geomHash = targetGeomHash.get(t);
+
             if (isReal && refId != null) {
                 long group = refIdToGroup.computeIfAbsent(refId, k -> t);
+                targetToGroup.put(t, group);
+            } else if (geomHash != null) {
+                long group = geomHashToGroup.computeIfAbsent(geomHash, k -> t);
                 targetToGroup.put(t, group);
             } else {
                 targetToGroup.put(t, t);
             }
         }
 
+        // Capacities для real-chamber.
         Set<String> distinctRefIds = new HashSet<>();
         for (Long t : allTargetVertexIds) {
             if (targetIsRealChamber.getOrDefault(t, false)) {
@@ -129,148 +136,86 @@ public class TieInCoordinationService {
                 if (refId != null) distinctRefIds.add(refId);
             }
         }
-
         for (String refId : distinctRefIds) {
             Integer existing = jdbc.queryForObject(
                     "SELECT COALESCE(count_chamber_attachments(?, ?), 0)",
-                    Integer.class,
-                    taskId, refId);
+                    Integer.class, taskId, refId);
             int cap = Math.max(0, MAX_ATTACHMENTS - (existing == null ? 0 : existing));
-            long group = refIdToGroup.get(refId);
-            remaining.put(group, cap);
+            remaining.put(refIdToGroup.get(refId), cap);
         }
 
+        // Capacities для edge projections / новых камер (по группам геометрии).
+        Set<Long> newGroups = new HashSet<>();
         for (Long t : allTargetVertexIds) {
             if (!targetIsRealChamber.getOrDefault(t, false)) {
-                remaining.put(t, MAX_ATTACHMENTS);
+                newGroups.add(targetToGroup.get(t));
             }
         }
+        for (Long g : newGroups) {
+            remaining.put(g, MAX_ATTACHMENTS);
+        }
 
-        long constrainedGroups = remaining.values().stream().filter(v -> v < MAX_ATTACHMENTS).count();
-        log.debug("[{}] computeCapacities: {} targets, {} групп, {} с ограниченной capacity",
-                taskId, allTargetVertexIds.size(), remaining.size(), constrainedGroups);
+        long constrained = remaining.values().stream().filter(v -> v < MAX_ATTACHMENTS).count();
+        log.debug("[{}] computeCapacities: {} targets, {} групп ({} real-chamber, {} edge/projection), {} ограниченных",
+                taskId, allTargetVertexIds.size(), remaining.size(),
+                distinctRefIds.size(), newGroups.size(), constrained);
 
         return new CapacityState(targetToGroup, remaining);
     }
 
     // ==========================================================================
-    // v1: individual
+    // v1: individual = SSP без cost-shift
     // ==========================================================================
 
     public Map<Long, PathResult> assignIndividual(Map<Long, List<PathResult>> allPaths,
                                                   CapacityState state) {
-        List<Long> oksSorted = new ArrayList<>(allPaths.keySet());
-        oksSorted.sort((a, b) -> {
-            int bySize = Integer.compare(allPaths.get(a).size(), allPaths.get(b).size());
-            if (bySize != 0) return bySize;
-            double minA = minCost(allPaths.get(a));
-            double minB = minCost(allPaths.get(b));
-            return Double.compare(minB, minA);
-        });
-
-        Map<Long, PathResult> result = new LinkedHashMap<>();
-        for (Long oks : oksSorted) {
-            List<PathResult> paths = new ArrayList<>(allPaths.get(oks));
-            paths.sort(Comparator.comparingDouble(PathResult::getTotalCost));
-            for (PathResult p : paths) {
-                long t = p.getToVertex();
-                if (state.remaining(t) > 0) {
-                    result.put(oks, p);
-                    state.consume(t);
-                    break;
-                }
-            }
-        }
-        return result;
+        return runSsp(allPaths, state, Collections.emptyMap());
     }
 
     // ==========================================================================
-    // v2: shared
+    // v2: shared через SSP с cost-shift к shared target
     // ==========================================================================
 
+    /**
+     * V64.4: вместо greedy — единый SSP для всей группы, где рёбра к
+     * preferred targets дешевле в COST_SHIFT_FACTOR раз. SSP максимизирует
+     * flow (все OKS будут назначены, если feasible), среди оптимумов
+     * предпочитает shared target.
+     *
+     * @param oksGroup         группа OKS (все OKS кластера)
+     * @param allPaths         пути
+     * @param state            capacity
+     * @param preferredTargets targets, к которым хотим стянуть OKS
+     */
     public Map<Long, PathResult> assignShared(Set<Long> oksGroup,
                                               Map<Long, List<PathResult>> allPaths,
-                                              CapacityState state) {
-        Map<Long, PathResult> result = new LinkedHashMap<>();
-        Set<Long> remainingOks = new HashSet<>(oksGroup);
-
-        while (!remainingOks.isEmpty()) {
-            Long sharedTarget = pickSharedTargetForGroup(remainingOks, allPaths, state);
-            if (sharedTarget == null) break;
-
-            int cap = state.remaining(sharedTarget);
-            if (cap <= 0) {
-                state.markExhausted(sharedTarget);
-                continue;
-            }
-
-            List<Long> reachable = new ArrayList<>();
-            for (Long oks : remainingOks) {
-                if (findPathTo(oks, sharedTarget, allPaths) != null) {
-                    reachable.add(oks);
-                }
-            }
-            if (reachable.isEmpty()) {
-                state.markExhausted(sharedTarget);
-                continue;
-            }
-
-            reachable.sort((a, b) -> Double.compare(
-                    costTo(b, sharedTarget, allPaths),
-                    costTo(a, sharedTarget, allPaths)));
-
-            int assignCount = Math.min(cap, reachable.size());
-            for (int i = 0; i < assignCount; i++) {
-                Long oks = reachable.get(i);
-                PathResult path = findPathTo(oks, sharedTarget, allPaths);
-                result.put(oks, path);
-                remainingOks.remove(oks);
-                state.consume(sharedTarget);
-            }
+                                              CapacityState state,
+                                              Set<Long> preferredTargets) {
+        // Если preferred пусто — просто SSP без сдвига.
+        if (preferredTargets == null || preferredTargets.isEmpty()) {
+            return runSsp(allPaths, state, Collections.emptyMap());
         }
 
-        if (!remainingOks.isEmpty()) {
-            Map<Long, List<PathResult>> tailPaths = new LinkedHashMap<>();
-            for (Long oks : remainingOks) {
-                tailPaths.put(oks, allPaths.get(oks));
-            }
-            result.putAll(assignIndividual(tailPaths, state));
+        // Считаем shared target для группы: покрытие + сумма cost.
+        // pickSharedTargetForGroup теперь возвращает один target.
+        // Может случиться, что preferredTargets содержит уже выбранный shared.
+        // Оставим эту логику на вызывающей стороне: она передаёт preferredTargets.
+
+        Map<Long, Double> shift = new HashMap<>();
+        for (Long t : preferredTargets) {
+            shift.put(t, COST_SHIFT_FACTOR);
         }
-        return result;
+
+        return runSsp(allPaths, state, shift);
     }
 
-    // ==========================================================================
-    // v3: sub-split
-    // ==========================================================================
-
-    public Map<Long, PathResult> assignSubSplit(List<Long> oksVertexIds,
-                                                Map<Long, List<PathResult>> allPaths,
-                                                CapacityState state,
-                                                Map<Long, Double> oksX) {
-        if (oksVertexIds.size() < 4) {
-            return assignIndividual(allPaths, state);
-        }
-
-        List<Long> sortedOks = new ArrayList<>(oksVertexIds);
-        sortedOks.sort(Comparator.comparingDouble(oks -> oksX.getOrDefault(oks, 0.0)));
-
-        int mid = sortedOks.size() / 2;
-        Set<Long> groupA = new HashSet<>(sortedOks.subList(0, mid));
-        Set<Long> groupB = new HashSet<>(sortedOks.subList(mid, sortedOks.size()));
-
-        Map<Long, PathResult> result = new LinkedHashMap<>();
-        result.putAll(assignShared(groupA, allPaths, state));
-        result.putAll(assignShared(groupB, allPaths, state));
-        return result;
-    }
-
-    // ==========================================================================
-    // Внутренние хелперы
-    // ==========================================================================
-
-    private Long pickSharedTargetForGroup(Set<Long> oksGroup,
-                                          Map<Long, List<PathResult>> allPaths,
-                                          CapacityState state) {
+    /**
+     * Определяет лучший shared target для группы OKS с учётом capacity.
+     * Возвращает null, если нет ни одного доступного.
+     */
+    public Long pickSharedTarget(Set<Long> oksGroup,
+                                 Map<Long, List<PathResult>> allPaths,
+                                 CapacityState state) {
         Map<Long, Integer> coverage = new HashMap<>();
         Map<Long, Double> sumCost = new HashMap<>();
 
@@ -303,24 +248,206 @@ public class TieInCoordinationService {
         return best;
     }
 
-    private static double minCost(List<PathResult> paths) {
-        double min = Double.MAX_VALUE;
-        for (PathResult p : paths) {
-            if (p.getTotalCost() < min) min = p.getTotalCost();
+    // ==========================================================================
+    // v3: sub-split через SSP с двумя preferred targets
+    // ==========================================================================
+
+    public Map<Long, PathResult> assignSubSplit(List<Long> oksVertexIds,
+                                                Map<Long, List<PathResult>> allPaths,
+                                                CapacityState state,
+                                                Map<Long, Double> oksX,
+                                                Set<Long> preferredTargets) {
+        if (oksVertexIds.size() < 4) {
+            return runSsp(allPaths, state,
+                    preferredTargets == null ? Collections.emptyMap() : shiftMap(preferredTargets));
         }
-        return min == Double.MAX_VALUE ? 0.0 : min;
+        return runSsp(allPaths, state,
+                preferredTargets == null ? Collections.emptyMap() : shiftMap(preferredTargets));
     }
 
-    private static double costTo(Long oks, Long target, Map<Long, List<PathResult>> allPaths) {
-        PathResult p = findPathTo(oks, target, allPaths);
-        return p == null ? Double.MAX_VALUE : p.getTotalCost();
+    private static Map<Long, Double> shiftMap(Set<Long> preferred) {
+        Map<Long, Double> m = new HashMap<>();
+        for (Long t : preferred) m.put(t, COST_SHIFT_FACTOR);
+        return m;
+    }
+
+    // ==========================================================================
+    // SSP — ядро. Общая для assignIndividual и assignShared.
+    // ==========================================================================
+
+    /**
+     * @param costShift если содержит target — умножаем его cost на это значение
+     *                  (в диапазоне (0, 1)); иначе cost без изменений.
+     */
+    private Map<Long, PathResult> runSsp(Map<Long, List<PathResult>> allPaths,
+                                         CapacityState state,
+                                         Map<Long, Double> costShift) {
+        if (allPaths.isEmpty()) return new LinkedHashMap<>();
+
+        List<Long> oksList = new ArrayList<>(allPaths.keySet());
+        Set<Long> targetsSet = new HashSet<>();
+        for (List<PathResult> paths : allPaths.values()) {
+            for (PathResult p : paths) targetsSet.add(p.getToVertex());
+        }
+        if (targetsSet.isEmpty()) return new LinkedHashMap<>();
+        List<Long> targetList = new ArrayList<>(targetsSet);
+
+        Map<Long, Integer> oksIndex = new HashMap<>();
+        for (int i = 0; i < oksList.size(); i++) oksIndex.put(oksList.get(i), i);
+        Map<Long, Integer> targetIndex = new HashMap<>();
+        for (int j = 0; j < targetList.size(); j++) targetIndex.put(targetList.get(j), j);
+
+        int n = oksList.size();
+        int m = targetList.size();
+        int sourceNode = 0;
+        int oksBase = 1;
+        int targetBase = n + 1;
+        int sinkNode = n + m + 1;
+        int numNodes = n + m + 2;
+
+        List<List<Edge>> graph = new ArrayList<>(numNodes);
+        for (int i = 0; i < numNodes; i++) graph.add(new ArrayList<>());
+
+        for (int i = 0; i < n; i++) addEdge(graph, sourceNode, oksBase + i, 1, 0L);
+
+        for (int j = 0; j < m; j++) {
+            long targetId = targetList.get(j);
+            int cap = state.remaining(targetId);
+            if (cap > 0) addEdge(graph, targetBase + j, sinkNode, cap, 0L);
+        }
+
+        for (Long oks : oksList) {
+            int oksIdx = oksIndex.get(oks);
+            for (PathResult p : allPaths.get(oks)) {
+                Integer tj = targetIndex.get(p.getToVertex());
+                if (tj == null) continue;
+                double w = p.getTotalCost();
+                Double shift = costShift.get(p.getToVertex());
+                if (shift != null) w *= shift;
+                long cost = Math.round(w * COST_SCALE);
+                if (cost < 0) cost = 0;
+                addEdge(graph, oksBase + oksIdx, targetBase + tj, 1, cost);
+            }
+        }
+
+        long[] potential = new long[numNodes];
+        long totalFlow = 0;
+
+        while (true) {
+            long[] dist = new long[numNodes];
+            int[] prevNode = new int[numNodes];
+            int[] prevEdgeIdx = new int[numNodes];
+            Arrays.fill(dist, Long.MAX_VALUE);
+            Arrays.fill(prevNode, -1);
+            dist[sourceNode] = 0;
+
+            PriorityQueue<long[]> pq = new PriorityQueue<>(Comparator.comparingLong(a -> a[0]));
+            pq.add(new long[]{0, sourceNode});
+
+            while (!pq.isEmpty()) {
+                long[] cur = pq.poll();
+                long d = cur[0];
+                int u = (int) cur[1];
+                if (d > dist[u]) continue;
+                List<Edge> edges = graph.get(u);
+                for (int i = 0; i < edges.size(); i++) {
+                    Edge e = edges.get(i);
+                    if (e.cap <= 0) continue;
+                    long reweighted = e.cost + potential[u] - potential[e.to];
+                    if (reweighted < 0) reweighted = 0;
+                    long nd = d + reweighted;
+                    if (nd < dist[e.to]) {
+                        dist[e.to] = nd;
+                        prevNode[e.to] = u;
+                        prevEdgeIdx[e.to] = i;
+                        pq.add(new long[]{nd, e.to});
+                    }
+                }
+            }
+
+            if (dist[sinkNode] == Long.MAX_VALUE) break;
+
+            for (int v = 0; v < numNodes; v++) {
+                if (dist[v] < Long.MAX_VALUE) potential[v] += dist[v];
+            }
+
+            int v = sinkNode;
+            while (v != sourceNode) {
+                int u = prevNode[v];
+                int eIdx = prevEdgeIdx[v];
+                Edge e = graph.get(u).get(eIdx);
+                e.cap -= 1;
+                graph.get(v).get(e.rev).cap += 1;
+                v = u;
+            }
+            totalFlow++;
+        }
+
+        Map<Long, PathResult> result = new LinkedHashMap<>();
+        for (int i = 0; i < n; i++) {
+            Long oks = oksList.get(i);
+            int oksNode = oksBase + i;
+            for (Edge e : graph.get(oksNode)) {
+                if (e.isReverse) continue;
+                if (e.to < targetBase || e.to >= targetBase + m) continue;
+                if (e.cap != 0) continue;
+                int tj = e.to - targetBase;
+                Long target = targetList.get(tj);
+                PathResult path = findPathTo(oks, target, allPaths);
+                if (path != null && !result.containsKey(oks)) {
+                    result.put(oks, path);
+                    state.consume(target);
+                }
+            }
+        }
+
+        List<Long> unconnected = new ArrayList<>();
+        for (Long oks : oksList) {
+            if (!result.containsKey(oks)) unconnected.add(oks);
+        }
+        if (!unconnected.isEmpty()) {
+            log.warn("SSP: {} OKS unconnected due to exhausted capacity: {}",
+                    unconnected.size(), unconnected);
+        } else {
+            log.debug("SSP: назначено {} из {} OKS (flow={})", result.size(), n, totalFlow);
+        }
+
+        return result;
+    }
+
+    // ==========================================================================
+    // Внутренние хелперы
+    // ==========================================================================
+
+    private static class Edge {
+        int to;
+        int rev;
+        int cap;
+        long cost;
+        boolean isReverse;
+
+        Edge(int to, int rev, int cap, long cost, boolean isReverse) {
+            this.to = to;
+            this.rev = rev;
+            this.cap = cap;
+            this.cost = cost;
+            this.isReverse = isReverse;
+        }
+    }
+
+    private static void addEdge(List<List<Edge>> graph, int from, int to, int cap, long cost) {
+        Edge forward = new Edge(to, graph.get(to).size(), cap, cost, false);
+        Edge backward = new Edge(from, graph.get(from).size(), 0, -cost, true);
+        graph.get(from).add(forward);
+        graph.get(to).add(backward);
     }
 
     private static PathResult findPathTo(Long oks, Long target, Map<Long, List<PathResult>> allPaths) {
         List<PathResult> paths = allPaths.get(oks);
         if (paths == null) return null;
+        long targetLong = target.longValue();
         for (PathResult p : paths) {
-            if (p.getToVertex() == target) return p;
+            if (p.getToVertex() == targetLong) return p;
         }
         return null;
     }
