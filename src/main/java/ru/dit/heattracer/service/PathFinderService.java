@@ -89,7 +89,16 @@ public class PathFinderService {
                         " WHERE vv.task_id = ? " +
                         "   AND vv.cluster_id = ? " +
                         "   AND vv.vertex_type = 'candidate' " +
-                        "   AND p.edge_count > 0",
+                        "   AND p.edge_count > 0 " +
+                        // V55: отбрасываем пути, проходящие через чужой OKS.
+                        "   AND NOT EXISTS ( " +
+                        "       SELECT 1 " +
+                        "         FROM unnest(p.edge_ids) AS eid " +
+                        "         JOIN visibility_edge ve ON ve.id = eid " +
+                        "         JOIN visibility_vertex vv2 " +
+                        "              ON vv2.id IN (ve.source_vertex, ve.target_vertex) " +
+                        "        WHERE vv2.vertex_type = 'oks' " +
+                        "          AND vv2.id <> ? ) ",
                 rs -> {
                     long target = rs.getLong("target_vertex");
                     String wkt = rs.getString("path_wkt");
@@ -112,11 +121,9 @@ public class PathFinderService {
                             rs.getInt("edge_count"),
                             wkt, ids, true));
                 },
-                // Аргументы идут по порядку появления ? в SQL: сначала 4 параметра LATERAL-функции
-                // (task_id, cluster_id, from_vertex, to_vertex=vv.id — привязан к строке, не передаём),
-                // затем task_id и cluster_id для WHERE.
                 taskId, clusterId, oksVertex,
-                taskId, clusterId);
+                taskId, clusterId,
+                oksVertex);
 
         long elapsed = System.currentTimeMillis() - start;
         log.info("[{}] Cluster {}: OKS vertex {} → {} paths found ({} ms)",

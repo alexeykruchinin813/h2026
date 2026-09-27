@@ -151,6 +151,23 @@ class HybridConnectivityIT extends BasePostgresIntegrationTest {
                 String.format("Недостаточно OKS с путём (мин по вариантам): %d из %d (ожидали ≥ %d).",
                         minWithPath, totalOksCount, expectedMin));
 
+        // V55: среди сохранённых путей нет транзита через чужой OKS.
+        Long foreignOksTransits = jdbcTemplate.queryForObject(
+                "SELECT count(*) " +
+                        "  FROM path_result pr " +
+                        " CROSS JOIN LATERAL unnest(pr.edge_ids) AS eid " +
+                        "  JOIN visibility_edge ve ON ve.id = eid " +
+                        "  JOIN visibility_vertex vv2 " +
+                        "       ON vv2.id IN (ve.source_vertex, ve.target_vertex) " +
+                        " WHERE pr.task_id = ? " +
+                        "   AND vv2.vertex_type = 'oks' " +
+                        "   AND vv2.id <> pr.oks_vertex_id",
+                Long.class, taskId);
+        assertEquals(0L, foreignOksTransits.longValue(),
+                "V55: ни один path_result не должен проходить через чужой OKS. " +
+                        "PathFinderService.findPathsFromOks фильтрует такие пути; " +
+                        "если assertion падает — фильтр не применяется.");
+
         // ===== P2.2: до трёх содержательно отличающихся вариантов =====
         List<Map<String, Object>> variants = jdbcTemplate.queryForList(
                 "SELECT id, rank, score, construction_cost, new_network_length, " +
