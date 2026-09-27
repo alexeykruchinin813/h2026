@@ -50,10 +50,27 @@ public class PhysicalNetworkService {
 
         if (r.segments == 0) return r;
 
-        // 2. ДУ, предельная длина, стоимости сегментов.
+        // 1b. V53: универсальный split узлов с degree > 4.
+        Integer splitOps = jdbc.queryForObject(
+                "SELECT split_oversized_chambers(?, ?, ?)",
+                Integer.class, taskId, variantId, 10);
+        if (splitOps != null && splitOps > 0) {
+            log.info("[{}][{}] split_oversized_chambers: {} nodes split",
+                    taskId, variantId, splitOps);
+            // Пересчитываем число узлов/сегментов после split.
+            r = jdbc.queryForObject(
+                    "SELECT count(*)::int AS s, " +
+                            "       (SELECT count(*)::int FROM physical_node " +
+                            "         WHERE task_id = ? AND variant_id = ?) AS n " +
+                            "FROM physical_segment WHERE task_id = ? AND variant_id = ?",
+                    (rs, i) -> new Result(rs.getInt("s"), rs.getInt("n")),
+                    taskId, variantId, taskId, variantId);
+        }
+
+        // 2. ДУ, предельная длина, стоимость.
         assignDiametersAndCosts(taskId, variantId);
 
-        // 3. Стоимость камер по max ДУ примыкающих сегментов (ТЗ 3.2).
+        // 3. Стоимость камер.
         computeChamberCosts(taskId, variantId);
 
         log.info("[{}][{}] PhysicalNetwork: {} segs, {} nodes in {} ms",
