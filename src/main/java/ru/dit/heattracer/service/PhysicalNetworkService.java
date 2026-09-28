@@ -321,7 +321,11 @@ public class PhysicalNetworkService {
     private int cascadeSplitOverloadedNodes(UUID taskId, String variantId) {
         final int MAX_ITER = 8;
         final int KEEP = 3;         // сколько сегментов оставляем у T
-        final double OFFSET = 0.5;  // смещение T' от T, м
+        // TODO V68: заменить на ST_Node-планаризацию (ветка st_split).
+        // Временно OFFSET=0: T' co-located с T, ствол нулевой длины.
+        // Это убирает новые пересечения от cascade, но оставляет "две камеры в одной точке".
+        // Плановое решение — planarize_physical_network через ST_Node.
+        final double OFFSET = 0.0;  // смещение T' от T, м
         int total = 0;
 
         for (int iter = 0; iter < MAX_ITER; iter++) {
