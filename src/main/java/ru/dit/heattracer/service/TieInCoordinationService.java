@@ -146,26 +146,18 @@ public class TieInCoordinationService {
             remaining.put(refIdToGroup.get(refId), cap);
         }
 
-        // V66: для graph_node-кандидатов учитываем существующую степень в базовом
-        // графе. До этого фикса existingDegree оставался пустым, capacity для
-        // graph_node = MAX_ATTACHMENTS, и после 4 OKS-путей физический degree
-        // становился 5 (нарушение ТЗ 2.3).
-        //
-        // Матчинг: visibility_vertex.ref_id ↔ graph_node.ext_id (или id).
-        // Степень считаем по геометрии graph_edge — это снимает зависимость
-        // от того, как именно называются FK-колонки в graph_edge.
-        //
-        // Для edge_projection соответствующего graph_node нет → JOIN пустой
-        // → existingDegree=0 → capacity=MAX_ATTACHMENTS (как и раньше).
-        // ИСПРАВЛЕНИЕ: Используем IN (?, ?, ...) вместо ANY(?), так как Spring JDBC
-        // нестабильно обрабатывает массивы и коллекции для ANY в данном контексте.
+        // V67: Capacities для не-chamber кандидатов.
+        // graph_node: existing_degree = число рёбер в 0.5м (сплит невозможен → ограничиваем заранее).
+        // edge_projection: existing_degree = 0 (сплит возможен → не ограничиваем,
+        //   перегруз разрулит split_oversized_chambers на этапе физ. сборки).
         Map<Long, Integer> existingDegree = new HashMap<>();
         if (!allTargetVertexIds.isEmpty()) {
-            // Генерируем плейсхолдеры: ?, ?, ?...
-            String placeholders = String.join(",", Collections.nCopies(allTargetVertexIds.size(), "?"));
-            Object[] args = new Object[allTargetVertexIds.size() + 1];
+            String placeholders = String.join(",",
+                    Collections.nCopies(allTargetVertexIds.size(), "?"));
+            Object[] args = new Object[allTargetVertexIds.size() + 2];
             args[0] = taskId;
-            int idx = 1;
+            args[1] = taskId;
+            int idx = 2;
             for (Long id : allTargetVertexIds) {
                 args[idx++] = id;
             }
@@ -173,24 +165,27 @@ public class TieInCoordinationService {
             jdbc.query(
                     "SELECT vv.id AS target_vertex_id, " +
                             "       (SELECT COUNT(*)::int FROM graph_edge ge " +
-                            "         WHERE ge.task_id = gn.task_id " +
-                            "           AND ST_DWithin(ge.geom, gn.geom, 0.1)) AS existing_degree " +
+                            "         WHERE ge.task_id = ? " +
+                            "           AND ST_DWithin(ge.geom, vv.geom, 0.5)) AS edge_count, " +
+                            "       EXISTS (SELECT 1 FROM graph_node gn " +
+                            "                WHERE gn.task_id = ? " +
+                            "                  AND ST_DWithin(gn.geom, vv.geom, 0.5)) AS is_graph_node " +
                             "FROM visibility_vertex vv " +
-                            "JOIN graph_node gn " +
-                            "  ON gn.task_id = vv.task_id " +
-                            " AND gn.ext_id::text = vv.ref_id " +
-                            "WHERE vv.task_id = ? " + // Явная фильтрация по задаче
-                            "  AND vv.id IN (" + placeholders + ")",
+                            "WHERE vv.id IN (" + placeholders + ")",
                     rs -> {
-                        existingDegree.put(
-                                rs.getLong("target_vertex_id"),
-                                rs.getInt("existing_degree"));
+                        long target = rs.getLong("target_vertex_id");
+                        int edgeCount = rs.getInt("edge_count");
+                        boolean isGraphNode = rs.getBoolean("is_graph_node");
+                        // graph_node: ограничиваем ёмкость (сплит невозможен)
+                        // edge_projection: НЕ ограничиваем (сплит разрулит перегруз)
+                        int degree = isGraphNode ? edgeCount : 0;
+                        existingDegree.put(target, degree);
                     },
                     args);
         }
 
         if (!existingDegree.isEmpty()) {
-            log.debug("[{}] computeCapacities: existing degree for {} graph_node targets: {}",
+            log.debug("[{}] computeCapacities: existing degree for {} non-chamber targets: {}",
                     taskId, existingDegree.size(), existingDegree);
         }
 
