@@ -561,23 +561,9 @@ public class PhysicalNetworkService {
                 double tx = tp[0], ty = tp[1];
 
                 Long t2 = jdbc.queryForObject(
-                        "SELECT id FROM physical_node " +
-                                "WHERE task_id = ? AND variant_id = ? " +
-                                "  AND ST_DWithin(geom, ST_SetSRID(ST_MakePoint(?, ?), 32637), 0.05) " +
-                                "  AND node_type IN ('existing_tie_in','branch_chamber') " +
-                                "ORDER BY CASE node_type " +
-                                "    WHEN 'existing_tie_in' THEN 0 " +
-                                "    WHEN 'branch_chamber'  THEN 1 " +
-                                "    ELSE 2 END, " +
-                                "    id " +
-                                "LIMIT 1",
+                        "INSERT INTO physical_node (task_id, variant_id, node_type, geom) " +
+                                "VALUES (?, ?, 'branch_chamber', ST_SetSRID(ST_MakePoint(?, ?), 32637)) RETURNING id",
                         Long.class, taskId, variantId, tx, ty);
-                if (t2 == null) {
-                    t2 = jdbc.queryForObject(
-                            "INSERT INTO physical_node (task_id, variant_id, node_type, geom) " +
-                                    "VALUES (?, ?, 'branch_chamber', ST_SetSRID(ST_MakePoint(?, ?), 32637)) RETURNING id",
-                            Long.class, taskId, variantId, tx, ty);
-                }
 
                 // Ствол T→T' = первый кусок w0 (коллинеарен базовой трубе).
                 namedJdbc.update(
