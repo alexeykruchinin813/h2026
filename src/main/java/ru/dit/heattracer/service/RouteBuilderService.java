@@ -173,8 +173,8 @@ public class RouteBuilderService {
                                 "        ST_Transform(ST_GeomFromText(?, 32637), 4326))",
                         taskId, variantId, "ps_" + variantId + "_" + r.get("id"), json, wkt, wkt);
             } catch (Exception ex) {
-                log.error("[{}][{}] writePhysicalSegment {} failed: {}",
-                        taskId, variantId, r.get("id"), ex.getMessage());
+                log.error("[{}][{}] writePhysicalSegment {} failed.",
+                        taskId, variantId, r.get("id"), ex);
             }
         }
     }
