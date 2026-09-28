@@ -8,9 +8,7 @@ import org.springframework.stereotype.Service;
 import ru.dit.heattracer.model.PathResult;
 
 import java.math.BigDecimal;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.UUID;
+import java.util.*;
 
 @Service
 public class PathFinderService {
@@ -22,6 +20,91 @@ public class PathFinderService {
     @Autowired
     public PathFinderService(JdbcTemplate jdbc) {
         this.jdbc = jdbc;
+    }
+
+    /**
+     * V72: multi-target Dijkstra от виртуального корня группы.
+     *
+     * <p>Все OKS группы идут через ОДНО дерево кратчайших путей от набора
+     * target-вершин группы. Рёбра дерева автоматически шарятся между OKS
+     * (устраняет радиальную топологию 17 независимых A*).
+     *
+     * <p>V55: SQL-функция исключает пути, проходящие через чужой OKS.
+     * Для отброшенных OKS Java-слой вызывает {@link #findSinglePath} для fallback.
+     *
+     * @param targetVertices все target-вершины группы (edge projections одной камеры)
+     * @param oksVertices    все OKS, назначенные SSP на эту группу
+     * @return по одному пути на каждую OKS; валидные шарят общие рёбра,
+     *         невалидные (транзит через чужой OKS) — fallback на одиночный A*
+     */
+    public List<PathResult> findSharedPathsFromGroup(
+            UUID taskId, int clusterId,
+            List<Long> targetVertices, List<Long> oksVertices) {
+
+        if (targetVertices == null || targetVertices.isEmpty()) return Collections.emptyList();
+        if (oksVertices == null || oksVertices.isEmpty())        return Collections.emptyList();
+
+        Long[] targetsArr = targetVertices.toArray(new Long[0]);
+        Long[] oksArr     = oksVertices.toArray(new Long[0]);
+
+        long start = System.currentTimeMillis();
+        List<PathResult> results = new ArrayList<>();
+        Set<Long> covered = new HashSet<>();
+
+        jdbc.query(
+                con -> {
+                    java.sql.PreparedStatement ps = con.prepareStatement(
+                            "SELECT oks_vertex_id, target_vertex_id, total_cost, total_length, " +
+                                    "       edge_count, ST_AsText(path_geom) AS path_wkt, edge_ids " +
+                                    "  FROM find_shared_paths_from_group(?, ?, ?, ?)");
+                    ps.setObject(1, taskId);
+                    ps.setInt(2, clusterId);
+                    ps.setArray(3, con.createArrayOf("bigint", targetsArr));
+                    ps.setArray(4, con.createArrayOf("bigint", oksArr));
+                    return ps;
+                },
+                rs -> {
+                    try {
+                        long oks = rs.getLong("oks_vertex_id");
+                        long target = rs.getLong("target_vertex_id");
+                        String wkt = rs.getString("path_wkt");
+                        java.sql.Array arr = rs.getArray("edge_ids");
+                        List<Long> ids = new ArrayList<>();
+                        if (arr != null) {
+                            Object raw = arr.getArray();
+                            if (raw instanceof Long[]) {
+                                for (Long id : (Long[]) raw) ids.add(id);
+                            } else if (raw instanceof Object[]) {
+                                for (Object id : (Object[]) raw) ids.add(((Number) id).longValue());
+                            }
+                        }
+                        results.add(new PathResult(
+                                oks, target,
+                                toDouble(rs.getBigDecimal("total_cost")),
+                                toDouble(rs.getBigDecimal("total_length")),
+                                rs.getInt("edge_count"),
+                                wkt, ids, true));
+                        covered.add(oks);
+                    } catch (java.sql.SQLException ex) {
+                        throw new RuntimeException(ex);
+                    }
+                });
+
+        // V55 fallback: для OKS, для которых shared paths отброшен (транзит через
+        // чужой OKS) или путь не найден, вызываем одиночный A*.
+        for (Long oks : oksVertices) {
+            if (covered.contains(oks)) continue;
+            PathResult fallback = findBestPathFromOks(taskId, clusterId, oks);
+            if (fallback != null) {
+                results.add(fallback);
+            }
+        }
+
+        long elapsed = System.currentTimeMillis() - start;
+        log.info("[{}] Cluster {}: shared paths for {} OKS (targets={}) in {} ms — {} via tree, {} fallback",
+                taskId, clusterId, results.size(), targetVertices.size(), elapsed,
+                covered.size(), results.size() - covered.size());
+        return results;
     }
 
     /**

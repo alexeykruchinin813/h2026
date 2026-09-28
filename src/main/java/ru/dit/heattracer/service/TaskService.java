@@ -307,18 +307,23 @@ public class TaskService {
 
             // Второй проход: назначаем с общей capacity-картой на вариант.
             for (ClusterPaths cp : clusterPathsList) {
-                // v1: чистый SSP
-                Map<Long, PathResult> v1 = tieInCoordinationService.assignIndividual(
-                        cp.allPaths, capV1);
+                int clusterId = cp.cluster.getClusterId();
 
-                // v2: один shared target для всего кластера
+                // v1: индивидуальное назначение через SSP
+                TieInCoordinationService.SspResult sspV1 =
+                        tieInCoordinationService.assignIndividual(cp.allPaths, capV1);
+                Map<Long, PathResult> v1 = rebuildSharedPaths(id, clusterId, sspV1, capV1);
+
+                // v2: shared target для всего кластера
                 Long sharedAll = tieInCoordinationService.pickSharedTarget(
                         new HashSet<>(cp.oksVertexIds), cp.allPaths, capV2);
                 Set<Long> preferredV2 = sharedAll == null
                         ? Collections.emptySet()
                         : Collections.singleton(sharedAll);
-                Map<Long, PathResult> v2 = tieInCoordinationService.assignShared(
-                        new HashSet<>(cp.oksVertexIds), cp.allPaths, capV2, preferredV2);
+                TieInCoordinationService.SspResult sspV2 =
+                        tieInCoordinationService.assignShared(
+                                new HashSet<>(cp.oksVertexIds), cp.allPaths, capV2, preferredV2);
+                Map<Long, PathResult> v2 = rebuildSharedPaths(id, clusterId, sspV2, capV2);
 
                 // v3: два shared target (sub-split по X)
                 Map<Long, PathResult> v3;
@@ -328,7 +333,7 @@ public class TaskService {
                             "SELECT id, ST_X(geom) AS x FROM visibility_vertex " +
                                     "WHERE task_id = ? AND cluster_id = ? AND vertex_type = 'oks'",
                             rs -> { oksX.put(rs.getLong("id"), rs.getDouble("x")); },
-                            id, cp.cluster.getClusterId());
+                            id, clusterId);
 
                     List<Long> sorted = new ArrayList<>(cp.oksVertexIds);
                     sorted.sort(Comparator.comparingDouble(oksX::get));
@@ -342,13 +347,14 @@ public class TaskService {
                     if (sharedA != null) preferredV3.add(sharedA);
                     if (sharedB != null && !sharedB.equals(sharedA)) preferredV3.add(sharedB);
 
-                    v3 = tieInCoordinationService.assignSubSplit(
-                            cp.oksVertexIds, cp.allPaths, capV3, oksX, preferredV3);
+                    TieInCoordinationService.SspResult sspV3 =
+                            tieInCoordinationService.assignSubSplit(
+                                    cp.oksVertexIds, cp.allPaths, capV3, oksX, preferredV3);
+                    v3 = rebuildSharedPaths(id, clusterId, sspV3, capV3);
                 } else {
                     v3 = new LinkedHashMap<>(v1);
                 }
 
-                int clusterId = cp.cluster.getClusterId();
                 for (Long oks : cp.oksVertexIds) {
                     if (v1.containsKey(oks)) savePath(id, "v1", clusterId, oks, v1.get(oks));
                     if (v2.containsKey(oks)) savePath(id, "v2", clusterId, oks, v2.get(oks));
@@ -483,6 +489,61 @@ public class TaskService {
         } finally {
             state.markFinished();
         }
+    }
+
+    /**
+     * V72: перестраивает пути по target-группам через multi-target Dijkstra.
+     *
+     * <p>SSP выбрал, какой OKS к какой target-группе идёт. Для каждой группы
+     * запускается {@link PathFinderService#findSharedPathsFromGroup} — один
+     * pgr_dijkstra от виртуального корня группы до всех OKS. Результат — дерево
+     * кратчайших путей: общие рёбра шарятся между OKS автоматически.
+     *
+     * <p>Для OKS, для которых shared path отброшен из-за транзита через чужой
+     * OKS (V55), PathFinderService делает fallback на одиночный A*.
+     */
+    private Map<Long, PathResult> rebuildSharedPaths(
+            UUID taskId, int clusterId,
+            TieInCoordinationService.SspResult ssp,
+            TieInCoordinationService.CapacityState state) {
+
+        if (ssp == null || ssp.isEmpty()) return new LinkedHashMap<>();
+
+        Map<Long, PathResult> result = new LinkedHashMap<>();
+
+        for (Map.Entry<Long, List<Long>> entry : ssp.byTargetGroup.entrySet()) {
+            long groupId = entry.getKey();
+            List<Long> oksList = entry.getValue();
+            if (oksList == null || oksList.isEmpty()) continue;
+
+            List<Long> targetVertices = state.targetsOfGroup(groupId);
+
+            if (targetVertices.isEmpty()) {
+                for (Long oks : oksList) {
+                    PathResult p = ssp.assigned.get(oks);
+                    if (p != null) result.put(oks, p);
+                }
+                continue;
+            }
+
+            List<PathResult> shared = pathFinderService.findSharedPathsFromGroup(
+                    taskId, clusterId, targetVertices, oksList);
+
+            Set<Long> covered = new HashSet<>();
+            for (PathResult p : shared) {
+                result.put(p.getFromVertex(), p);
+                covered.add(p.getFromVertex());
+            }
+
+            for (Long oks : oksList) {
+                if (!covered.contains(oks)) {
+                    PathResult p = ssp.assigned.get(oks);
+                    if (p != null) result.put(oks, p);
+                }
+            }
+        }
+
+        return result;
     }
 
     /**
