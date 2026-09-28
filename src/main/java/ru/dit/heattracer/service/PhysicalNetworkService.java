@@ -3,6 +3,8 @@ package ru.dit.heattracer.service;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
+import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 import org.springframework.stereotype.Service;
 import ru.dit.heattracer.model.DiameterSpec;
 
@@ -33,37 +35,20 @@ public class PhysicalNetworkService {
     private final JdbcTemplate jdbc;
     private final DiameterPicker diameterPicker;
 
+    private final NamedParameterJdbcTemplate namedJdbc;
+
     public PhysicalNetworkService(JdbcTemplate jdbc, DiameterPicker diameterPicker) {
         this.jdbc = jdbc;
         this.diameterPicker = diameterPicker;
+        this.namedJdbc = new NamedParameterJdbcTemplate(jdbc);
     }
 
-    /**
-     * V70-final: порядок сборки физической сети варианта.
-     *
-     * 1.  build_physical_network      — базовая топология из путей SSP (SQL, без изменений);
-     * 1b. cascadeSplitOverloadedNodes — V69: «звезда» degree>4 → цепочка co-located камер
-     *     (OFFSET = 0, ствол T→T' нулевой длины);
-     * 1c. split_oversized_chambers    — V53/V63: универсальный сплит новых камер;
-     * 1d. dedupParallelSegments       — V70 (НОВОЕ): удаление 2-циклов (параллельных
-     *     сегментов между одной парой узлов) — артефакт cascade-split при OFFSET=0;
-     *     flow удалённого сегмента сливается в оставленный;
-     * 1e. цикл max-length по ДУ       — существующий, без изменений;
-     * 2.  assignDiametersAndCosts     — существующий, без изменений (после дедупа,
-     *     чтобы ДУ/стоимость считались по слитому расходу).
-     *
-     * ВАЖНО: вызова planarize_physical_network (V68) здесь быть НЕ должно —
-     * ветка st_split удалена, ST_Node-планаризация ломала топологию (116 пересечений).
-     */
     public Result build(UUID taskId, String variantId) {
         long startMs = System.currentTimeMillis();
 
         // ------------------------------------------------------------------
-        // 1. Базовая топология: твой существующий вызов build_physical_network,
-        //    без изменений. Например:
-        //      Result r = jdbc.queryForObject("SELECT * FROM build_physical_network(?, ?)", ...);
+        // 1. Базовая топология: SQL-функция build_physical_network.
         // ------------------------------------------------------------------
-        // 1. Топология.
         Result r = jdbc.queryForObject(
                 "SELECT segments, nodes FROM build_physical_network(?, ?)",
                 (rs, i) -> new Result(rs.getInt("segments"), rs.getInt("nodes")),
@@ -73,8 +58,8 @@ public class PhysicalNetworkService {
         }
 
         // ------------------------------------------------------------------
-        // 1b. V69: каскадный сплит перегруженных узлов (degree > 4).
-        //     OFFSET = 0 внутри метода: T' создаётся в той же точке, что и T.
+        // 1b. V74: каскадный сплит перегруженных узлов (degree > 4).
+        //     Ствол T→T' — кусок базового колеса длиной 0.4 м (коллинеарен).
         // ------------------------------------------------------------------
         int cascaded = cascadeSplitOverloadedNodes(taskId, variantId);
         if (cascaded > 0) {
@@ -84,7 +69,7 @@ public class PhysicalNetworkService {
         }
 
         // ------------------------------------------------------------------
-        // 1c. V53/V63: универсальный сплит новых камер (существующий вызов).
+        // 1c. V53/V63: универсальный сплит новых камер.
         // ------------------------------------------------------------------
         Integer splitOps = jdbc.queryForObject(
                 "SELECT split_oversized_chambers(?, ?, ?)",
@@ -95,8 +80,7 @@ public class PhysicalNetworkService {
         }
 
         // ------------------------------------------------------------------
-        // 1d. V70 (НОВОЕ): дедупликация параллельных сегментов.
-        //     СТРОГО после всех топологических сплитов и ДО присвоения ДУ/стоимостей.
+        // 1d. V70: дедупликация параллельных сегментов (2-циклы).
         // ------------------------------------------------------------------
         int deduped = dedupParallelSegments(taskId, variantId);
         if (deduped > 0) {
@@ -105,15 +89,33 @@ public class PhysicalNetworkService {
         }
 
         // ------------------------------------------------------------------
-        // 1e + 2. Существующий хвост build() без изменений и в текущем порядке:
-        //     цикл предельной длины по ДУ (лог "max_length iterations: N")
-        //     и assignDiametersAndCosts(taskId, variantId).
-        //     Дедуп выше гарантирует, что они получают чистую топологию
-        //     и слитые расходы.
+        // 1e. Первичное назначение ДУ и стоимостей.
+        //     БЕЗ этого шага цикл предельных длин видит diameter=NULL и пропускает
+        //     всё, RouteBuilder получает segmentCost=0, writePhysicalSegment NPE.
         // ------------------------------------------------------------------
+        assignDiametersAndCosts(taskId, variantId);
 
         // ------------------------------------------------------------------
-        // 3. Финальные счётчики (существующий лог "PhysicalNetwork: ...").
+        // 2. Цикл предельных длин: повышает ДУ сегментов, превышающих лимит.
+        //     Повторяем до стабилизации (максимум 12 итераций).
+        // ------------------------------------------------------------------
+        for (int iter = 0; iter < 12; iter++) {
+            Integer upgraded = jdbc.queryForObject(
+                    "SELECT upgrade_oversized_segments(?, ?)",
+                    Integer.class, taskId, variantId);
+            if (upgraded == null || upgraded == 0) break;
+            log.debug("[{}][{}] max_length iterations: {} segments upgraded",
+                    taskId, variantId, upgraded);
+        }
+
+        // ------------------------------------------------------------------
+        // 2b. Пересчёт стоимостей по ФИНАЛЬНЫМ ДУ (после цикла предельных длин).
+        //     Не трогаем diameter, только cost = length_m * special_k * price(diameter).
+        // ------------------------------------------------------------------
+        recalcCosts(taskId, variantId);
+
+        // ------------------------------------------------------------------
+        // 3. Финальные счётчики.
         // ------------------------------------------------------------------
         r = recount(taskId, variantId);
         log.info("[{}][{}] PhysicalNetwork: {} segs, {} nodes in {} ms",
@@ -133,54 +135,28 @@ public class PhysicalNetworkService {
     }
 
     /**
-     * V70: удаляет параллельные сегменты (2-циклы) — пары сегментов, соединяющие
-     * одну и ту же НЕупорядоченную пару узлов. Артефакт cascade-split при OFFSET=0:
-     * перенесённый и оставшийся сегменты схлопываются в одну пару узлов и
-     * геометрически накладываются → V46 считает это пересечением вне узла.
-     *
-     * Flow удалённого сегмента сливается в оставленный (с наибольшим flow),
-     * чтобы ДУ и стоимость позже считались по суммарному расходу направления.
-     * Связность не страдает: второе ребро пары дублировало маршрут.
+     * Пересчёт стоимостей по финальным ДУ (после цикла предельных длин).
+     * Не переназначает diameter — только cost = length_m * special_k * price.
      */
-    private int dedupParallelSegments(UUID taskId, String variantId) {
-        // 1) слить суммарный flow в оставляемый сегмент пары
+    private void recalcCosts(UUID taskId, String variantId) {
         jdbc.update(
-                "UPDATE physical_segment k SET flow_tph = p.sum_flow " +
-                        "FROM ( " +
-                        "    SELECT LEAST(start_node_id, end_node_id) AS a, " +
-                        "           GREATEST(start_node_id, end_node_id) AS b, " +
-                        "           SUM(flow_tph) AS sum_flow " +
-                        "    FROM physical_segment " +
-                        "    WHERE task_id = ? AND variant_id = ? " +
-                        "    GROUP BY 1, 2 " +
-                        "    HAVING COUNT(*) > 1 " +
-                        ") p " +
-                        "WHERE k.task_id = ? AND k.variant_id = ? " +
-                        "  AND LEAST(k.start_node_id, k.end_node_id) = p.a " +
-                        "  AND GREATEST(k.start_node_id, k.end_node_id) = p.b " +
-                        "  AND k.id = ( " +
-                        "        SELECT w.id FROM physical_segment w " +
-                        "        WHERE w.task_id = k.task_id AND w.variant_id = k.variant_id " +
-                        "          AND LEAST(w.start_node_id, w.end_node_id) = p.a " +
-                        "          AND GREATEST(w.start_node_id, w.end_node_id) = p.b " +
-                        "        ORDER BY w.flow_tph DESC, w.id ASC " +
-                        "        LIMIT 1)",
-                taskId, variantId, taskId, variantId);
+                "UPDATE physical_segment s SET cost = s.length_m * s.special_k * " +
+                        "  CASE WHEN s.diameter <= 100 THEN 3780.0  WHEN s.diameter <= 125 THEN 4050.0 " +
+                        "       WHEN s.diameter <= 150 THEN 4590.0  WHEN s.diameter <= 200 THEN 5580.0 " +
+                        "       WHEN s.diameter <= 250 THEN 6840.0  WHEN s.diameter <= 300 THEN 8370.0 " +
+                        "       WHEN s.diameter <= 400 THEN 11070.0 WHEN s.diameter <= 500 THEN 13860.0 " +
+                        "       WHEN s.diameter <= 600 THEN 16740.0 WHEN s.diameter <= 700 THEN 19530.0 " +
+                        "       WHEN s.diameter <= 800 THEN 22410.0 WHEN s.diameter <= 900 THEN 25200.0 " +
+                        "       WHEN s.diameter <= 1000 THEN 28080.0 WHEN s.diameter <= 1200 THEN 33660.0 " +
+                        "       ELSE 39330.0 END " +
+                        "WHERE s.task_id = ? AND s.variant_id = ? AND s.diameter IS NOT NULL",
+                taskId, variantId);
+    }
 
-        // 2) удалить дубликаты (оставляем геометрию с наибольшим flow)
-        return jdbc.update(
-                "DELETE FROM physical_segment " +
-                        "WHERE task_id = ? AND variant_id = ? " +
-                        "  AND id IN ( " +
-                        "    SELECT id FROM ( " +
-                        "        SELECT id, ROW_NUMBER() OVER ( " +
-                        "            PARTITION BY LEAST(start_node_id, end_node_id), " +
-                        "                         GREATEST(start_node_id, end_node_id) " +
-                        "            ORDER BY flow_tph DESC, id ASC) AS rn " +
-                        "        FROM physical_segment " +
-                        "        WHERE task_id = ? AND variant_id = ? " +
-                        "    ) t WHERE rn > 1)",
-                taskId, variantId, taskId, variantId);
+    private int dedupParallelSegments(UUID taskId, String variantId) {
+        return jdbc.queryForObject(
+                "SELECT dedup_parallel_segments(?, ?)",
+                Integer.class, taskId, variantId);
     }
 
     // ====================================================================
@@ -396,22 +372,21 @@ public class PhysicalNetworkService {
     }
 
     /**
-     * V69+V73: каскадный сплит перегруженных узлов (degree > 4).
-     * T' создаётся CO-LOCATED с T (OFFSET = 0) и БЕЗ ствола T→T':
-     * связанные только по FK co-located камеры — доказанная рабочая модель
-     * (дети split_oversized_chambers, V53/V63): в исходном прогоне с ними
-     * null_diam=0 и bad_crossings=0. Нулевой ствол ломал V46 (LINESTRING EMPTY)
-     * и гидравлический обход (null_diam=63), ненулевой (OFFSET>0) — давал
-     * изгибы хвостов и ST_MultiPoint-пересечения.
+     * V74: каскадный сплит узлов degree > 4. Ствол T→T' — кусок базового колеса w0
+     * длиной TRUNK_LEN (коллинеарен существующей трубе), остаток w0 уходит T'→далеко,
+     * перенесённые колёса получают конец в T' (изгиб ≤ TRUNK_LEN у конца).
+     * Все мутации — через NamedParameterJdbcTemplate: рассинхрон positional-аргументов
+     * невозможен физически.
      */
     private int cascadeSplitOverloadedNodes(UUID taskId, String variantId) {
         final int MAX_ITER = 8;
-        final int KEEP = 3;
+        final int KEEP = 4;            // 3 OKS-колеса + ствол у T
+        final double TRUNK_LEN = 0.4;
         int total = 0;
 
         for (int iter = 0; iter < MAX_ITER; iter++) {
             List<Map<String, Object>> over = jdbc.queryForList(
-                    "SELECT n.id AS node_id, ST_X(n.geom) AS x, ST_Y(n.geom) AS y, " +
+                    "SELECT n.id AS node_id, " +
                             "       (SELECT COUNT(*)::int FROM physical_segment s " +
                             "         WHERE s.task_id = n.task_id AND s.variant_id = n.variant_id " +
                             "           AND (s.start_node_id = n.id OR s.end_node_id = n.id)) AS deg " +
@@ -427,11 +402,8 @@ public class PhysicalNetworkService {
 
             for (Map<String, Object> row : over) {
                 long t = ((Number) row.get("node_id")).longValue();
-                double x = ((Number) row.get("x")).doubleValue();
-                double y = ((Number) row.get("y")).doubleValue();
                 int deg = ((Number) row.get("deg")).intValue();
 
-                // Base-first: базовые сегменты оставляем у T.
                 List<Long> segs = jdbc.queryForList(
                         "SELECT s.id FROM physical_segment s " +
                                 "WHERE s.task_id = ? AND s.variant_id = ? " +
@@ -449,43 +421,96 @@ public class PhysicalNetworkService {
                                 "                      (SELECT geom FROM physical_segment WHERE id = ?), 0.1))",
                         Boolean.class, taskId, segs.get(0));
                 if (!Boolean.TRUE.equals(firstIsBase)) {
-                    log.warn("[{}][{}] cascade-split: node {} first segment still NOT base " +
-                                    "even after base-first ordering — review graph_edge table",
+                    log.warn("[{}][{}] cascade-split: node {} first segment NOT base — trunk on new wheel",
                             taskId, variantId, t);
                 }
 
+                long w0 = segs.get(0);
                 List<Long> move = new ArrayList<>(segs.subList(KEEP, segs.size()));
+                List<Long> cutSet = new ArrayList<>(move);
+                cutSet.add(w0);
 
-                // T' в той же точке, что и T. БЕЗ INSERT ствола.
+                Double trunkFlow = jdbc.queryForObject(
+                        "SELECT COALESCE(SUM(flow_tph),0) FROM physical_segment WHERE id = ANY (?)",
+                        Double.class, (Object) cutSet.toArray(new Long[0]));
+
+                // T' на w0 в TRUNK_LEN метрах от T (ориентация от T).
+                double[] tp = namedJdbc.queryForObject(
+                        "SELECT ST_X(p) AS x, ST_Y(p) AS y FROM ( " +
+                                "  SELECT ST_LineInterpolatePoint(g2, LEAST(:trunk / l, 0.5)) AS p FROM ( " +
+                                "    SELECT CASE WHEN start_node_id = :t THEN geom ELSE ST_Reverse(geom) END AS g2, " +
+                                "           ST_Length(geom) AS l " +
+                                "    FROM physical_segment WHERE id = :w0) s) q",
+                        new MapSqlParameterSource()
+                                .addValue("trunk", TRUNK_LEN).addValue("t", t).addValue("w0", w0),
+                        (rs, i) -> new double[]{rs.getDouble("x"), rs.getDouble("y")});
+                double tx = tp[0], ty = tp[1];
+
                 Long t2 = jdbc.queryForObject(
                         "INSERT INTO physical_node (task_id, variant_id, node_type, geom) " +
-                                "VALUES (?, ?, 'branch_chamber', ST_SetSRID(ST_MakePoint(?, ?), 32637)) " +
-                                "RETURNING id",
-                        Long.class, taskId, variantId, x, y);
+                                "VALUES (?, ?, 'branch_chamber', ST_SetSRID(ST_MakePoint(?, ?), 32637)) RETURNING id",
+                        Long.class, taskId, variantId, tx, ty);
 
-                // Переносим сегменты на T' (FK + страховка синхронизации геометрии;
-                // при OFFSET=0 ST_SetPoint — no-op, но гарантирует ТЗ 7.2,
-                // если координаты узла когда-либо снапнулись).
+                // Ствол T→T' = первый кусок w0 (коллинеарен базовой трубе).
+                namedJdbc.update(
+                        "INSERT INTO physical_segment " +
+                                "  (task_id, variant_id, start_node_id, end_node_id, flow_tph, " +
+                                "   laying_method, geom, length_m) " +
+                                "SELECT :taskId, :variantId, :t, :t2, :flow, 'base', g.geom, ST_Length(g.geom) " +
+                                "FROM (SELECT CASE WHEN start_node_id = :t " +
+                                "             THEN ST_LineSubstring(geom, 0, LEAST(:trunk / ST_Length(geom), 0.5)) " +
+                                "             ELSE ST_Reverse(ST_LineSubstring(ST_Reverse(geom), 0, LEAST(:trunk / ST_Length(geom), 0.5))) " +
+                                "        END AS geom FROM physical_segment WHERE id = :w0) g",
+                        new MapSqlParameterSource()
+                                .addValue("taskId", taskId).addValue("variantId", variantId)
+                                .addValue("t", t).addValue("t2", t2)
+                                .addValue("flow", trunkFlow).addValue("trunk", TRUNK_LEN)
+                                .addValue("w0", w0));
+
+                // Остаток w0: конец у T заменяется на T'.
+                // ВАЖНО: в PostgreSQL все выражения SET видят СТАРУЮ строку, поэтому
+                // CASE по start_node_id корректен одновременно с заменой FK.
+                namedJdbc.update(
+                        "UPDATE physical_segment SET " +
+                                "  geom = CASE WHEN start_node_id = :t " +
+                                "         THEN ST_LineSubstring(geom, LEAST(:trunk / ST_Length(geom), 0.5), 1) " +
+                                "         ELSE ST_Reverse(ST_LineSubstring(ST_Reverse(geom), LEAST(:trunk / ST_Length(geom), 0.5), 1)) END, " +
+                                "  start_node_id = CASE WHEN start_node_id = :t THEN :t2 ELSE start_node_id END, " +
+                                "  end_node_id   = CASE WHEN end_node_id   = :t THEN :t2 ELSE end_node_id   END " +
+                                "WHERE id = :w0",
+                        new MapSqlParameterSource()
+                                .addValue("t", t).addValue("trunk", TRUNK_LEN)
+                                .addValue("t2", t2).addValue("w0", w0));
+                namedJdbc.update(
+                        "UPDATE physical_segment SET length_m = ST_Length(geom) WHERE id = :w0",
+                        new MapSqlParameterSource().addValue("w0", w0));
+
+                // Переносимые колёса: конец у T переносим в T' (изгиб ≤ TRUNK_LEN у конца).
                 for (Long sid : move) {
-                    int moved = jdbc.update(
+                    int moved = namedJdbc.update(
                             "UPDATE physical_segment SET " +
-                                    "  start_node_id = CASE WHEN start_node_id = ? THEN ? ELSE start_node_id END, " +
-                                    "  end_node_id   = CASE WHEN end_node_id   = ? THEN ? ELSE end_node_id   END, " +
-                                    "  geom = CASE WHEN start_node_id = ? " +
-                                    "         THEN ST_SetPoint(geom, 0, ST_SetSRID(ST_MakePoint(?, ?), 32637)) " +
-                                    "         ELSE ST_SetPoint(geom, ST_NumPoints(geom) - 1, ST_SetSRID(ST_MakePoint(?, ?), 32637)) END " +
-                                    "WHERE id = ?",
-                            t, t2, t, t2, t, x, y, x, y, sid);
+                                    "  start_node_id = CASE WHEN start_node_id = :t THEN :t2 ELSE start_node_id END, " +
+                                    "  end_node_id   = CASE WHEN end_node_id   = :t THEN :t2 ELSE end_node_id   END, " +
+                                    "  geom = CASE WHEN start_node_id = :t " +
+                                    "         THEN ST_SetPoint(geom, 0, ST_SetSRID(ST_MakePoint(:x, :y), 32637)) " +
+                                    "         ELSE ST_SetPoint(geom, ST_NumPoints(geom) - 1, ST_SetSRID(ST_MakePoint(:x, :y), 32637)) END " +
+                                    "WHERE id = :sid",
+                            new MapSqlParameterSource()
+                                    .addValue("t", t).addValue("t2", t2)
+                                    .addValue("x", tx).addValue("y", ty)
+                                    .addValue("sid", sid));
                     if (moved != 1) {
                         log.error("[{}][{}] cascade-split: UPDATE seg {} affected {} rows — parameter misalignment!",
                                 taskId, variantId, sid, moved);
                     }
-                    jdbc.update("UPDATE physical_segment SET length_m = ST_Length(geom) WHERE id = ?", sid);
+                    namedJdbc.update(
+                            "UPDATE physical_segment SET length_m = ST_Length(geom) WHERE id = :sid",
+                            new MapSqlParameterSource().addValue("sid", sid));
                 }
 
                 total++;
-                log.info("[{}][{}] cascade-split iter {}: node {} (deg={}) -> T'={} (moved {} segs, no trunk)",
-                        taskId, variantId, iter, t, deg, t2, move.size());
+                log.info("[{}][{}] cascade-split iter {}: node {} (deg={}) -> T'={} (moved {} segs, trunk {} m collinear)",
+                        taskId, variantId, iter, t, deg, t2, move.size(), TRUNK_LEN);
             }
         }
         return total;
