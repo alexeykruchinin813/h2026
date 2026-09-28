@@ -51,12 +51,16 @@ public class TieInCoordinationService {
             this.remaining = remaining;
         }
 
-        private long groupOf(long targetVertexId) {
+        public long groupOf(long targetVertexId) {              // ← было private
             return targetToGroup.getOrDefault(targetVertexId, targetVertexId);
         }
 
         public int remaining(long targetVertexId) {
             return remaining.getOrDefault(groupOf(targetVertexId), 0);
+        }
+
+        public int remainingForGroup(long groupId) {            // ← НОВЫЙ метод
+            return remaining.getOrDefault(groupId, 0);
         }
 
         public void consume(long targetVertexId) {
@@ -87,6 +91,12 @@ public class TieInCoordinationService {
         Long[] targetArr = allTargetVertexIds.toArray(new Long[0]);
 
         // Собираем: id, ref_id, is_real_chamber, geom_hash (снап 0.01 м).
+        //
+        // V71: is_real_chamber теперь требует геометрического совпадения с камерой.
+        // Без ST_DWithin(f.geom_utm, vv.geom, 0.01) edge projections с ref_id,
+        // совпавшим с feature_id nearby-камеры (106, 107, ...), ошибочно попадали
+        // в одну группу с этой камерой. Capacity группы = 4 − attachments,
+        // а не 4 per projection → кластер не мог разместить все OKS.
         Map<Long, String> targetRefId = new HashMap<>();
         Map<Long, Boolean> targetIsRealChamber = new HashMap<>();
         Map<Long, String> targetGeomHash = new HashMap<>();
@@ -99,6 +109,7 @@ public class TieInCoordinationService {
                         "         WHERE f.task_id = ? " +
                         "           AND f.feature_id::text = vv.ref_id " +
                         "           AND f.object_type = 'heat_chamber' " +
+                        "           AND ST_DWithin(f.geom_utm, vv.geom, 0.01) " +   // ← V71
                         "       ) AS is_real_chamber " +
                         "FROM visibility_vertex vv " +
                         "WHERE vv.id = ANY (?)",
@@ -110,7 +121,7 @@ public class TieInCoordinationService {
                 },
                 taskId, targetArr);
 
-        // Группировка: real-chamber → по ref_id; edge projection → по геометрии.
+        // Группировка: real-chamber → по ref_id; edge projection → по geom_hash.
         Map<String, Long> refIdToGroup = new HashMap<>();
         Map<String, Long> geomHashToGroup = new HashMap<>();
 
@@ -130,7 +141,7 @@ public class TieInCoordinationService {
             }
         }
 
-        // Capacities для real-chamber.
+        // Capacities для real-chamber (единственное место, где ограничение честное).
         Set<String> distinctRefIds = new HashSet<>();
         for (Long t : allTargetVertexIds) {
             if (targetIsRealChamber.getOrDefault(t, false)) {
@@ -146,62 +157,18 @@ public class TieInCoordinationService {
             remaining.put(refIdToGroup.get(refId), cap);
         }
 
-        // V67: Capacities для не-chamber кандидатов.
-        // graph_node: existing_degree = число рёбер в 0.5м (сплит невозможен → ограничиваем заранее).
-        // edge_projection: existing_degree = 0 (сплит возможен → не ограничиваем,
-        //   перегруз разрулит split_oversized_chambers на этапе физ. сборки).
-        Map<Long, Integer> existingDegree = new HashMap<>();
-        if (!allTargetVertexIds.isEmpty()) {
-            String placeholders = String.join(",",
-                    Collections.nCopies(allTargetVertexIds.size(), "?"));
-            Object[] args = new Object[allTargetVertexIds.size() + 2];
-            args[0] = taskId;
-            args[1] = taskId;
-            int idx = 2;
-            for (Long id : allTargetVertexIds) {
-                args[idx++] = id;
-            }
-
-            jdbc.query(
-                    "SELECT vv.id AS target_vertex_id, " +
-                            "       (SELECT COUNT(*)::int FROM graph_edge ge " +
-                            "         WHERE ge.task_id = ? " +
-                            "           AND ST_DWithin(ge.geom, vv.geom, 0.5)) AS edge_count, " +
-                            "       EXISTS (SELECT 1 FROM graph_node gn " +
-                            "                WHERE gn.task_id = ? " +
-                            "                  AND ST_DWithin(gn.geom, vv.geom, 0.5)) AS is_graph_node " +
-                            "FROM visibility_vertex vv " +
-                            "WHERE vv.id IN (" + placeholders + ")",
-                    rs -> {
-                        long target = rs.getLong("target_vertex_id");
-                        int edgeCount = rs.getInt("edge_count");
-                        boolean isGraphNode = rs.getBoolean("is_graph_node");
-                        // graph_node: ограничиваем ёмкость (сплит невозможен)
-                        // edge_projection: НЕ ограничиваем (сплит разрулит перегруз)
-                        int degree = isGraphNode ? edgeCount : 0;
-                        existingDegree.put(target, degree);
-                    },
-                    args);
-        }
-
-        if (!existingDegree.isEmpty()) {
-            log.debug("[{}] computeCapacities: existing degree for {} non-chamber targets: {}",
-                    taskId, existingDegree.size(), existingDegree);
-        }
-
+        // Capacities для edge projections / graph_node — всегда MAX_ATTACHMENTS.
+        // Перегруз разруливает физический слой:
+        //   split_oversized_chambers (V53) — для новых камер,
+        //   cascadeSplitOverloadedNodes (V69) — для существующих врезок.
         Set<Long> newGroups = new HashSet<>();
-        Map<Long, Integer> groupMaxExisting = new HashMap<>();
         for (Long t : allTargetVertexIds) {
             if (!targetIsRealChamber.getOrDefault(t, false)) {
-                long g = targetToGroup.get(t);
-                newGroups.add(g);
-                int deg = existingDegree.getOrDefault(t, 0);
-                groupMaxExisting.merge(g, deg, Math::max);
+                newGroups.add(targetToGroup.get(t));
             }
         }
         for (Long g : newGroups) {
-            int maxExisting = groupMaxExisting.getOrDefault(g, 0);
-            remaining.put(g, Math.max(0, MAX_ATTACHMENTS - maxExisting));
+            remaining.put(g, MAX_ATTACHMENTS);
         }
 
         long constrained = remaining.values().stream().filter(v -> v < MAX_ATTACHMENTS).count();
@@ -328,6 +295,18 @@ public class TieInCoordinationService {
      * @param costShift если содержит target — умножаем его cost на это значение
      *                  (в диапазоне (0, 1)); иначе cost без изменений.
      */
+    /**
+     * SSP-ядро: строит потоковую сеть source → OKS → target → sink.
+     *
+     * V64: каждый target получает собственное ребро к sink с capacity = remaining(target).
+     * Если несколько target принадлежат одной группе (например, edge projections
+     * одной камеры), capacity группы фактически дублируется по числу target —
+     * это осознанное решение: физический слой (V53 + V69) разрулит перегруз,
+     * а SSP получает свободу для сохранения связности 17/17.
+     *
+     * @param costShift если содержит target — умножаем его cost на это значение
+     *                  (в диапазоне (0, 1)); иначе cost без изменений.
+     */
     private Map<Long, PathResult> runSsp(Map<Long, List<PathResult>> allPaths,
                                          CapacityState state,
                                          Map<Long, Double> costShift) {
@@ -357,14 +336,17 @@ public class TieInCoordinationService {
         List<List<Edge>> graph = new ArrayList<>(numNodes);
         for (int i = 0; i < numNodes; i++) graph.add(new ArrayList<>());
 
+        // source → OKS (cap=1)
         for (int i = 0; i < n; i++) addEdge(graph, sourceNode, oksBase + i, 1, 0L);
 
+        // target → sink (cap = remaining(target); группа эмулируется дублированием)
         for (int j = 0; j < m; j++) {
             long targetId = targetList.get(j);
             int cap = state.remaining(targetId);
             if (cap > 0) addEdge(graph, targetBase + j, sinkNode, cap, 0L);
         }
 
+        // OKS → target (cap=1, cost = total_cost * shift)
         for (Long oks : oksList) {
             int oksIdx = oksIndex.get(oks);
             for (PathResult p : allPaths.get(oks)) {
@@ -379,6 +361,7 @@ public class TieInCoordinationService {
             }
         }
 
+        // SSP (Successive Shortest Path с потенциалами)
         long[] potential = new long[numNodes];
         long totalFlow = 0;
 
@@ -432,6 +415,7 @@ public class TieInCoordinationService {
             totalFlow++;
         }
 
+        // Извлечение результатов
         Map<Long, PathResult> result = new LinkedHashMap<>();
         for (int i = 0; i < n; i++) {
             Long oks = oksList.get(i);

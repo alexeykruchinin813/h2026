@@ -50,9 +50,21 @@ public class PhysicalNetworkService {
 
         if (r.segments == 0) return r;
 
-        // 1b. V53: универсальный split узлов с degree > 4.
-        Integer splitOps = jdbc.queryForObject(
-                "SELECT split_oversized_chambers(?, ?, ?)",
+        // 1b. V69: каскадный сплит перегруженных existing_tie_in / branch_chamber.
+        int cascaded = cascadeSplitOverloadedNodes(taskId, variantId);
+        if (cascaded > 0) {
+            log.info("[{}][{}] cascade-split: {} overloaded nodes resolved",
+                    taskId, variantId, cascaded);
+            // Пересчитать count'ы после сплита.
+            r = jdbc.queryForObject(
+                    "SELECT (SELECT count(*)::int FROM physical_segment WHERE task_id=? AND variant_id=?) AS s, " +
+                            "       (SELECT count(*)::int FROM physical_node WHERE task_id=? AND variant_id=?) AS n",
+                    (rs, i) -> new Result(rs.getInt("s"), rs.getInt("n")),
+                    taskId, variantId, taskId, variantId);
+        }
+
+        // 1c. V53: универсальный split узлов с degree > 4 (как было).
+        Integer splitOps = jdbc.queryForObject("SELECT split_oversized_chambers(?, ?, ?)",
                 Integer.class, taskId, variantId, 10);
         if (splitOps != null && splitOps > 0) {
             log.info("[{}][{}] split_oversized_chambers: {} nodes split",
@@ -288,6 +300,136 @@ public class PhysicalNetworkService {
             if (all.get(i).getDiameter() == current) return all.get(i + 1).getDiameter();
         }
         return current;
+    }
+
+    /**
+     * V69: каскадный сплит перегруженных узлов (degree > 4).
+     *
+     * Заменяет "звезду" на цепочку co-located камер:
+     *   T (deg=4) ←trunk→ T' (deg≤4) ← ... → T'' (deg≤4)
+     *
+     * Хвостовые сегменты переносятся на T', смещённую на 0.5 м вдоль
+     * среднего направления переносимых сегментов. Геометрии синхронизируются
+     * с узлами (ТЗ 7.2), длины пересчитываются, ДУ/стоимость делегируются
+     * проходу assignDiametersAndCosts.
+     *
+     * V71: base-first ORDER BY. Базовые сегменты (совпадающие с graph_edge)
+     * гарантированно остаются у T. Раньше полагались на порядок вставки
+     * в build_physical_network — на датасете это оказалось неверным
+     * (WARN "first segment is NOT base" срабатывал на всех вариантах).
+     */
+    private int cascadeSplitOverloadedNodes(UUID taskId, String variantId) {
+        final int MAX_ITER = 8;
+        final int KEEP = 3;         // сколько сегментов оставляем у T
+        final double OFFSET = 0.5;  // смещение T' от T, м
+        int total = 0;
+
+        for (int iter = 0; iter < MAX_ITER; iter++) {
+            List<Map<String, Object>> over = jdbc.queryForList(
+                    "SELECT n.id AS node_id, ST_X(n.geom) AS x, ST_Y(n.geom) AS y, " +
+                            "       (SELECT COUNT(*)::int FROM physical_segment s " +
+                            "         WHERE s.task_id = n.task_id AND s.variant_id = n.variant_id " +
+                            "           AND (s.start_node_id = n.id OR s.end_node_id = n.id)) AS deg " +
+                            "FROM physical_node n " +
+                            "WHERE n.task_id = ? AND n.variant_id = ? " +
+                            "  AND n.node_type IN ('existing_tie_in','branch_chamber') " +
+                            "  AND (SELECT COUNT(*) FROM physical_segment s " +
+                            "        WHERE s.task_id = n.task_id AND s.variant_id = n.variant_id " +
+                            "          AND (s.start_node_id = n.id OR s.end_node_id = n.id)) > 4 " +
+                            "ORDER BY n.id",
+                    taskId, variantId);
+            if (over.isEmpty()) break;
+
+            for (Map<String, Object> row : over) {
+                long t = ((Number) row.get("node_id")).longValue();
+                double x = ((Number) row.get("x")).doubleValue();
+                double y = ((Number) row.get("y")).doubleValue();
+                int deg = ((Number) row.get("deg")).intValue();
+
+                // V71: base-first — базовые сегменты (совпадающие с graph_edge)
+                // идут первыми и гарантированно остаются у T в KEEP.
+                List<Long> segs = jdbc.queryForList(
+                        "SELECT s.id FROM physical_segment s " +
+                                "WHERE s.task_id = ? AND s.variant_id = ? " +
+                                "  AND (s.start_node_id = ? OR s.end_node_id = ?) " +
+                                "ORDER BY EXISTS (SELECT 1 FROM graph_edge ge " +
+                                "                  WHERE ge.task_id = s.task_id " +
+                                "                    AND ST_DWithin(ge.geom, s.geom, 0.1)) DESC, " +
+                                "         s.id ASC",
+                        Long.class, taskId, variantId, t, t);
+                if (segs.size() <= 4) continue;
+
+                // Страховочный assert: первый сегмент должен быть базовым.
+                Boolean firstIsBase = jdbc.queryForObject(
+                        "SELECT EXISTS (SELECT 1 FROM graph_edge ge " +
+                                "                WHERE ge.task_id = ? AND ST_DWithin(ge.geom, " +
+                                "                      (SELECT geom FROM physical_segment WHERE id = ?), 0.1))",
+                        Boolean.class, taskId, segs.get(0));
+                if (!Boolean.TRUE.equals(firstIsBase)) {
+                    log.warn("[{}][{}] cascade-split: node {} first segment still NOT base " +
+                                    "even after base-first ordering — review graph_edge table",
+                            taskId, variantId, t);
+                }
+
+                List<Long> move = new ArrayList<>(segs.subList(KEEP, segs.size()));
+                Long[] moveArr = move.toArray(new Long[0]);
+
+                // Направление на T': средний вектор к дальним концам переносимых сегментов.
+                double[] d = jdbc.queryForObject(
+                        "SELECT COALESCE(AVG(dx), 1.0) AS dx, COALESCE(AVG(dy), 0.0) AS dy FROM (" +
+                                "  SELECT ST_X(ST_PointN(geom, CASE WHEN start_node_id = ? THEN ST_NumPoints(geom) ELSE 1 END)) - ? AS dx, " +
+                                "         ST_Y(ST_PointN(geom, CASE WHEN start_node_id = ? THEN ST_NumPoints(geom) ELSE 1 END)) - ? AS dy " +
+                                "  FROM physical_segment WHERE id = ANY (?) ) v",
+                        (rs, i) -> new double[]{rs.getDouble("dx"), rs.getDouble("dy")},
+                        t, x, t, y, moveArr);
+                double len = Math.hypot(d[0], d[1]);
+                if (len < 1e-9) { d[0] = 1; d[1] = 0; len = 1; }
+                double tx = x + OFFSET * d[0] / len;
+                double ty = y + OFFSET * d[1] / len;
+
+                // Создаём T' (branch_chamber)
+                Long t2 = jdbc.queryForObject(
+                        "INSERT INTO physical_node (task_id, variant_id, node_type, geom) " +
+                                "VALUES (?, ?, 'branch_chamber', ST_SetSRID(ST_MakePoint(?, ?), 32637)) " +
+                                "RETURNING id",
+                        Long.class, taskId, variantId, tx, ty);
+
+                // Переносим сегменты: FK + геометрия (ТЗ 7.2) + длина.
+                for (Long sid : move) {
+                    jdbc.update(
+                            "UPDATE physical_segment SET " +
+                                    "  start_node_id = CASE WHEN start_node_id = ? THEN ? ELSE start_node_id END, " +
+                                    "  end_node_id   = CASE WHEN end_node_id   = ? THEN ? ELSE end_node_id   END, " +
+                                    "  geom = CASE WHEN start_node_id = ? " +
+                                    "         THEN ST_SetPoint(geom, 0, ST_SetSRID(ST_MakePoint(?, ?), 32637)) " +
+                                    "         ELSE ST_SetPoint(geom, ST_NumPoints(geom) - 1, ST_SetSRID(ST_MakePoint(?, ?), 32637)) END " +
+                                    "WHERE id = ?",
+                            t, t2, t, t2, t, tx, ty, tx, ty, sid);
+                    jdbc.update("UPDATE physical_segment SET length_m = ST_Length(geom) WHERE id = ?", sid);
+                }
+
+                // Ствол T -> T'. length_m вычисляется инлайн (NOT NULL).
+                // diameter/cost оставляем NULL — их проставит assignDiametersAndCosts.
+                Double trunkFlow = jdbc.queryForObject(
+                        "SELECT COALESCE(SUM(flow_tph), 0) FROM physical_segment WHERE id = ANY (?)",
+                        Double.class, (Object) moveArr);
+                jdbc.update(
+                        "INSERT INTO physical_segment " +
+                                "  (task_id, variant_id, start_node_id, end_node_id, flow_tph, " +
+                                "   laying_method, geom, length_m) " +
+                                "VALUES (?, ?, ?, ?, ?, 'base', " +
+                                "        ST_SetSRID(ST_MakeLine(ST_MakePoint(?, ?), ST_MakePoint(?, ?)), 32637), " +
+                                "        ST_Length(ST_SetSRID(ST_MakeLine(ST_MakePoint(?, ?), ST_MakePoint(?, ?)), 32637)))",
+                        taskId, variantId, t, t2, trunkFlow,
+                        x, y, tx, ty,
+                        x, y, tx, ty);
+
+                total++;
+                log.info("[{}][{}] cascade-split iter {}: node {} (deg={}) -> T'={} (moved {} segs, trunk flow={})",
+                        taskId, variantId, iter, t, deg, t2, move.size(), trunkFlow);
+            }
+        }
+        return total;
     }
 
     // ====================================================================
