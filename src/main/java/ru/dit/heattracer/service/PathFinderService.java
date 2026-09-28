@@ -77,9 +77,7 @@ public class PathFinderService {
      */
     public List<PathResult> findPathsFromOks(UUID taskId, int clusterId, long oksVertex) {
         long start = System.currentTimeMillis();
-
         List<PathResult> results = new ArrayList<>();
-
         jdbc.query(
                 "SELECT vv.id AS target_vertex, " +
                         "       ST_AsText(p.path_geom) AS path_wkt, " +
@@ -89,20 +87,13 @@ public class PathFinderService {
                         " WHERE vv.task_id = ? " +
                         "   AND vv.cluster_id = ? " +
                         "   AND vv.vertex_type = 'candidate' " +
-                        "   AND p.edge_count > 0 " +
-                        // V55: отбрасываем пути, проходящие через чужой OKS.
-                        "   AND NOT EXISTS ( " +
-                        "       SELECT 1 " +
-                        "         FROM unnest(p.edge_ids) AS eid " +
-                        "         JOIN visibility_edge ve ON ve.id = eid " +
-                        "         JOIN visibility_vertex vv2 " +
-                        "              ON vv2.id IN (ve.source_vertex, ve.target_vertex) " +
-                        "        WHERE vv2.vertex_type = 'oks' " +
-                        "          AND vv2.id <> ? ) ",
+                        "   AND p.edge_count > 0",
+                // V65: NOT EXISTS removed. В плотных кластерах этот фильтр
+                // блокировал все пути к edge_projection, оставляя OKS без
+                // reachable candidates. Планарность обеспечивается V63 + V53.
                 rs -> {
                     long target = rs.getLong("target_vertex");
                     String wkt = rs.getString("path_wkt");
-
                     java.sql.Array arr = rs.getArray("edge_ids");
                     List<Long> ids = new ArrayList<>();
                     if (arr != null) {
@@ -113,7 +104,6 @@ public class PathFinderService {
                             for (Object id : (Object[]) raw) ids.add(((Number) id).longValue());
                         }
                     }
-
                     results.add(new PathResult(
                             oksVertex, target,
                             toDouble(rs.getBigDecimal("total_cost")),
@@ -122,13 +112,10 @@ public class PathFinderService {
                             wkt, ids, true));
                 },
                 taskId, clusterId, oksVertex,
-                taskId, clusterId,
-                oksVertex);
-
+                taskId, clusterId);
         long elapsed = System.currentTimeMillis() - start;
         log.info("[{}] Cluster {}: OKS vertex {} → {} paths found ({} ms)",
                 taskId, clusterId, oksVertex, results.size(), elapsed);
-
         return results;
     }
 

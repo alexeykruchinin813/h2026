@@ -3,7 +3,9 @@ package ru.dit.heattracer.service;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.core.RowCallbackHandler;
 import org.springframework.stereotype.Service;
+
 import ru.dit.heattracer.model.PathResult;
 
 import java.util.*;
@@ -144,15 +146,67 @@ public class TieInCoordinationService {
             remaining.put(refIdToGroup.get(refId), cap);
         }
 
-        // Capacities для edge projections / новых камер (по группам геометрии).
+        // V66: для graph_node-кандидатов учитываем существующую степень в базовом
+        // графе. До этого фикса existingDegree оставался пустым, capacity для
+        // graph_node = MAX_ATTACHMENTS, и после 4 OKS-путей физический degree
+        // становился 5 (нарушение ТЗ 2.3).
+        //
+        // Матчинг: visibility_vertex.ref_id ↔ graph_node.ext_id (или id).
+        // Степень считаем по геометрии graph_edge — это снимает зависимость
+        // от того, как именно называются FK-колонки в graph_edge.
+        //
+        // Для edge_projection соответствующего graph_node нет → JOIN пустой
+        // → existingDegree=0 → capacity=MAX_ATTACHMENTS (как и раньше).
+        // ИСПРАВЛЕНИЕ: Используем IN (?, ?, ...) вместо ANY(?), так как Spring JDBC
+        // нестабильно обрабатывает массивы и коллекции для ANY в данном контексте.
+        Map<Long, Integer> existingDegree = new HashMap<>();
+        if (!allTargetVertexIds.isEmpty()) {
+            // Генерируем плейсхолдеры: ?, ?, ?...
+            String placeholders = String.join(",", Collections.nCopies(allTargetVertexIds.size(), "?"));
+            Object[] args = new Object[allTargetVertexIds.size() + 1];
+            args[0] = taskId;
+            int idx = 1;
+            for (Long id : allTargetVertexIds) {
+                args[idx++] = id;
+            }
+
+            jdbc.query(
+                    "SELECT vv.id AS target_vertex_id, " +
+                            "       (SELECT COUNT(*)::int FROM graph_edge ge " +
+                            "         WHERE ge.task_id = gn.task_id " +
+                            "           AND ST_DWithin(ge.geom, gn.geom, 0.1)) AS existing_degree " +
+                            "FROM visibility_vertex vv " +
+                            "JOIN graph_node gn " +
+                            "  ON gn.task_id = vv.task_id " +
+                            " AND gn.ext_id::text = vv.ref_id " +
+                            "WHERE vv.task_id = ? " + // Явная фильтрация по задаче
+                            "  AND vv.id IN (" + placeholders + ")",
+                    rs -> {
+                        existingDegree.put(
+                                rs.getLong("target_vertex_id"),
+                                rs.getInt("existing_degree"));
+                    },
+                    args);
+        }
+
+        if (!existingDegree.isEmpty()) {
+            log.debug("[{}] computeCapacities: existing degree for {} graph_node targets: {}",
+                    taskId, existingDegree.size(), existingDegree);
+        }
+
         Set<Long> newGroups = new HashSet<>();
+        Map<Long, Integer> groupMaxExisting = new HashMap<>();
         for (Long t : allTargetVertexIds) {
             if (!targetIsRealChamber.getOrDefault(t, false)) {
-                newGroups.add(targetToGroup.get(t));
+                long g = targetToGroup.get(t);
+                newGroups.add(g);
+                int deg = existingDegree.getOrDefault(t, 0);
+                groupMaxExisting.merge(g, deg, Math::max);
             }
         }
         for (Long g : newGroups) {
-            remaining.put(g, MAX_ATTACHMENTS);
+            int maxExisting = groupMaxExisting.getOrDefault(g, 0);
+            remaining.put(g, Math.max(0, MAX_ATTACHMENTS - maxExisting));
         }
 
         long constrained = remaining.values().stream().filter(v -> v < MAX_ATTACHMENTS).count();
