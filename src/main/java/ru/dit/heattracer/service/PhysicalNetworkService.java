@@ -70,6 +70,20 @@ public class PhysicalNetworkService {
                     taskId, variantId, splitOps);
         }
 
+        // 3.5 Слияние коллинеарных путей
+        int merged = mergeCoincidentNodes(taskId, variantId);
+        if (merged > 0) {
+            log.info("[{}][{}] mergeCoincidentNodes: {} coincident nodes merged",
+                    taskId, variantId, merged);
+            Integer resplit = jdbc.queryForObject(
+                    "SELECT split_oversized_chambers(?, ?, ?)",
+                    Integer.class, taskId, variantId, 4);
+            if (resplit != null && resplit > 0) {
+                log.info("[{}][{}] re-split after merge: {} nodes", taskId, variantId, resplit);
+            }
+
+        }
+
         // 4. Дедупликация параллельных сегментов
         int deduped = dedupParallelSegments(taskId, variantId);
         if (deduped > 0) {
@@ -328,7 +342,9 @@ public class PhysicalNetworkService {
                             "       ST_Y(ST_Intersection(a.geom, b.geom)) AS iy " +
                             "FROM physical_segment a " +
                             "JOIN physical_segment b ON a.id < b.id " +
-                            "  AND ST_Crosses(a.geom, b.geom) " +
+                            "  AND ST_Intersects(a.geom, b.geom) " +
+                            "  AND NOT ST_Touches(a.geom, b.geom) " +
+                            "  AND ST_GeometryType(ST_Intersection(a.geom, b.geom)) = 'ST_Point'" +
                             "WHERE a.task_id = ? AND a.variant_id = ? " +
                             "LIMIT 1",
                     taskId, variantId);
@@ -545,9 +561,23 @@ public class PhysicalNetworkService {
                 double tx = tp[0], ty = tp[1];
 
                 Long t2 = jdbc.queryForObject(
-                        "INSERT INTO physical_node (task_id, variant_id, node_type, geom) " +
-                                "VALUES (?, ?, 'branch_chamber', ST_SetSRID(ST_MakePoint(?, ?), 32637)) RETURNING id",
+                        "SELECT id FROM physical_node " +
+                                "WHERE task_id = ? AND variant_id = ? " +
+                                "  AND ST_DWithin(geom, ST_SetSRID(ST_MakePoint(?, ?), 32637), 0.05) " +
+                                "  AND node_type IN ('existing_tie_in','branch_chamber') " +
+                                "ORDER BY CASE node_type " +
+                                "    WHEN 'existing_tie_in' THEN 0 " +
+                                "    WHEN 'branch_chamber'  THEN 1 " +
+                                "    ELSE 2 END, " +
+                                "    id " +
+                                "LIMIT 1",
                         Long.class, taskId, variantId, tx, ty);
+                if (t2 == null) {
+                    t2 = jdbc.queryForObject(
+                            "INSERT INTO physical_node (task_id, variant_id, node_type, geom) " +
+                                    "VALUES (?, ?, 'branch_chamber', ST_SetSRID(ST_MakePoint(?, ?), 32637)) RETURNING id",
+                            Long.class, taskId, variantId, tx, ty);
+                }
 
                 // Ствол T→T' = первый кусок w0 (коллинеарен базовой трубе).
                 namedJdbc.update(
@@ -650,6 +680,55 @@ public class PhysicalNetworkService {
                 taskId, variantId, taskId, variantId,
                 taskId, variantId, taskId, variantId,
                 taskId, variantId, taskId, variantId);
+    }
+
+    private int mergeCoincidentNodes(UUID taskId, String variantId) {
+        int total = 0;
+        for (int iter = 0; iter < 50; iter++) {
+            List<Map<String, Object>> pair = jdbc.queryForList(
+                    "SELECT a.id AS aid, b.id AS bid, " +
+                            "  CASE " +
+                            "    WHEN a.node_type = 'oks' THEN a.id " +
+                            "    WHEN b.node_type = 'oks' THEN b.id " +
+                            "    WHEN a.node_type = 'existing_tie_in' THEN a.id " +
+                            "    WHEN b.node_type = 'existing_tie_in' THEN b.id " +
+                            "    ELSE LEAST(a.id, b.id) " +
+                            "  END AS keep_id, " +
+                            "  CASE " +
+                            "    WHEN a.node_type = 'oks' THEN b.id " +
+                            "    WHEN b.node_type = 'oks' THEN a.id " +
+                            "    WHEN a.node_type = 'existing_tie_in' THEN b.id " +
+                            "    WHEN b.node_type = 'existing_tie_in' THEN a.id " +
+                            "    ELSE GREATEST(a.id, b.id) " +
+                            "  END AS drop_id " +
+                            "FROM physical_node a " +
+                            "JOIN physical_node b ON a.id < b.id " +
+                            "  AND a.task_id = b.task_id AND a.variant_id = b.variant_id " +
+                            "  AND ST_DWithin(a.geom, b.geom, 0.05) " +   // 5 см
+                            "WHERE a.task_id = ? AND a.variant_id = ? " +
+                            "  AND NOT (a.node_type = 'oks' AND b.node_type = 'oks') " + // OKS не сливаем между собой
+                            "LIMIT 1",
+                    taskId, variantId);
+
+            if (pair.isEmpty()) break;
+
+            long keepId = ((Number) pair.get(0).get("keep_id")).longValue();
+            long dropId = ((Number) pair.get(0).get("drop_id")).longValue();
+
+            // 1) перенаправить FK всех сегментов с drop на keep
+            jdbc.update(
+                    "UPDATE physical_segment SET " +
+                            "  start_node_id = CASE WHEN start_node_id = ? THEN ? ELSE start_node_id END, " +
+                            "  end_node_id   = CASE WHEN end_node_id   = ? THEN ? ELSE end_node_id   END " +
+                            "WHERE task_id = ? AND variant_id = ? " +
+                            "  AND (start_node_id = ? OR end_node_id = ?)",
+                    dropId, keepId, dropId, keepId, taskId, variantId, dropId, dropId);
+
+            // 2) удалить дубль-узел
+            jdbc.update("DELETE FROM physical_node WHERE id = ?", dropId);
+            total++;
+        }
+        return total;
     }
 
     public static class Result {
