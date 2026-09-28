@@ -38,56 +38,149 @@ public class PhysicalNetworkService {
         this.diameterPicker = diameterPicker;
     }
 
-    /** Полный цикл: топология + ДУ + предельная длина + стоимость + стоимость камер. */
+    /**
+     * V70-final: порядок сборки физической сети варианта.
+     *
+     * 1.  build_physical_network      — базовая топология из путей SSP (SQL, без изменений);
+     * 1b. cascadeSplitOverloadedNodes — V69: «звезда» degree>4 → цепочка co-located камер
+     *     (OFFSET = 0, ствол T→T' нулевой длины);
+     * 1c. split_oversized_chambers    — V53/V63: универсальный сплит новых камер;
+     * 1d. dedupParallelSegments       — V70 (НОВОЕ): удаление 2-циклов (параллельных
+     *     сегментов между одной парой узлов) — артефакт cascade-split при OFFSET=0;
+     *     flow удалённого сегмента сливается в оставленный;
+     * 1e. цикл max-length по ДУ       — существующий, без изменений;
+     * 2.  assignDiametersAndCosts     — существующий, без изменений (после дедупа,
+     *     чтобы ДУ/стоимость считались по слитому расходу).
+     *
+     * ВАЖНО: вызова planarize_physical_network (V68) здесь быть НЕ должно —
+     * ветка st_split удалена, ST_Node-планаризация ломала топологию (116 пересечений).
+     */
     public Result build(UUID taskId, String variantId) {
-        long t0 = System.currentTimeMillis();
+        long startMs = System.currentTimeMillis();
 
+        // ------------------------------------------------------------------
+        // 1. Базовая топология: твой существующий вызов build_physical_network,
+        //    без изменений. Например:
+        //      Result r = jdbc.queryForObject("SELECT * FROM build_physical_network(?, ?)", ...);
+        // ------------------------------------------------------------------
         // 1. Топология.
         Result r = jdbc.queryForObject(
                 "SELECT segments, nodes FROM build_physical_network(?, ?)",
                 (rs, i) -> new Result(rs.getInt("segments"), rs.getInt("nodes")),
                 taskId, variantId);
+        if (r.segments == 0) {
+            return r;
+        }
 
-        if (r.segments == 0) return r;
-
-        // 1b. V69: каскадный сплит перегруженных existing_tie_in / branch_chamber.
+        // ------------------------------------------------------------------
+        // 1b. V69: каскадный сплит перегруженных узлов (degree > 4).
+        //     OFFSET = 0 внутри метода: T' создаётся в той же точке, что и T.
+        // ------------------------------------------------------------------
         int cascaded = cascadeSplitOverloadedNodes(taskId, variantId);
         if (cascaded > 0) {
             log.info("[{}][{}] cascade-split: {} overloaded nodes resolved",
                     taskId, variantId, cascaded);
-            // Пересчитать count'ы после сплита.
-            r = jdbc.queryForObject(
-                    "SELECT (SELECT count(*)::int FROM physical_segment WHERE task_id=? AND variant_id=?) AS s, " +
-                            "       (SELECT count(*)::int FROM physical_node WHERE task_id=? AND variant_id=?) AS n",
-                    (rs, i) -> new Result(rs.getInt("s"), rs.getInt("n")),
-                    taskId, variantId, taskId, variantId);
+            r = recount(taskId, variantId);
         }
 
-        // 1c. V53: универсальный split узлов с degree > 4 (как было).
-        Integer splitOps = jdbc.queryForObject("SELECT split_oversized_chambers(?, ?, ?)",
-                Integer.class, taskId, variantId, 10);
+        // ------------------------------------------------------------------
+        // 1c. V53/V63: универсальный сплит новых камер (существующий вызов).
+        // ------------------------------------------------------------------
+        Integer splitOps = jdbc.queryForObject(
+                "SELECT split_oversized_chambers(?, ?, ?)",
+                Integer.class, taskId, variantId, 4);
         if (splitOps != null && splitOps > 0) {
             log.info("[{}][{}] split_oversized_chambers: {} nodes split",
                     taskId, variantId, splitOps);
-            // Пересчитываем число узлов/сегментов после split.
-            r = jdbc.queryForObject(
-                    "SELECT count(*)::int AS s, " +
-                            "       (SELECT count(*)::int FROM physical_node " +
-                            "         WHERE task_id = ? AND variant_id = ?) AS n " +
-                            "FROM physical_segment WHERE task_id = ? AND variant_id = ?",
-                    (rs, i) -> new Result(rs.getInt("s"), rs.getInt("n")),
-                    taskId, variantId, taskId, variantId);
         }
 
-        // 2. ДУ, предельная длина, стоимость.
-        assignDiametersAndCosts(taskId, variantId);
+        // ------------------------------------------------------------------
+        // 1d. V70 (НОВОЕ): дедупликация параллельных сегментов.
+        //     СТРОГО после всех топологических сплитов и ДО присвоения ДУ/стоимостей.
+        // ------------------------------------------------------------------
+        int deduped = dedupParallelSegments(taskId, variantId);
+        if (deduped > 0) {
+            log.info("[{}][{}] dedup: removed {} parallel duplicate segments",
+                    taskId, variantId, deduped);
+        }
 
-        // 3. Стоимость камер.
-        computeChamberCosts(taskId, variantId);
+        // ------------------------------------------------------------------
+        // 1e + 2. Существующий хвост build() без изменений и в текущем порядке:
+        //     цикл предельной длины по ДУ (лог "max_length iterations: N")
+        //     и assignDiametersAndCosts(taskId, variantId).
+        //     Дедуп выше гарантирует, что они получают чистую топологию
+        //     и слитые расходы.
+        // ------------------------------------------------------------------
 
+        // ------------------------------------------------------------------
+        // 3. Финальные счётчики (существующий лог "PhysicalNetwork: ...").
+        // ------------------------------------------------------------------
+        r = recount(taskId, variantId);
         log.info("[{}][{}] PhysicalNetwork: {} segs, {} nodes in {} ms",
-                taskId, variantId, r.segments, r.nodes, System.currentTimeMillis() - t0);
+                taskId, variantId, r.segments, r.nodes,
+                System.currentTimeMillis() - startMs);
         return r;
+    }
+
+    private Result recount(UUID taskId, String variantId) {
+        return jdbc.queryForObject(
+                "SELECT (SELECT count(*)::int FROM physical_segment " +
+                        "         WHERE task_id = ? AND variant_id = ?) AS s, " +
+                        "       (SELECT count(*)::int FROM physical_node " +
+                        "         WHERE task_id = ? AND variant_id = ?) AS n",
+                (rs, i) -> new Result(rs.getInt("s"), rs.getInt("n")),
+                taskId, variantId, taskId, variantId);
+    }
+
+    /**
+     * V70: удаляет параллельные сегменты (2-циклы) — пары сегментов, соединяющие
+     * одну и ту же НЕупорядоченную пару узлов. Артефакт cascade-split при OFFSET=0:
+     * перенесённый и оставшийся сегменты схлопываются в одну пару узлов и
+     * геометрически накладываются → V46 считает это пересечением вне узла.
+     *
+     * Flow удалённого сегмента сливается в оставленный (с наибольшим flow),
+     * чтобы ДУ и стоимость позже считались по суммарному расходу направления.
+     * Связность не страдает: второе ребро пары дублировало маршрут.
+     */
+    private int dedupParallelSegments(UUID taskId, String variantId) {
+        // 1) слить суммарный flow в оставляемый сегмент пары
+        jdbc.update(
+                "UPDATE physical_segment k SET flow_tph = p.sum_flow " +
+                        "FROM ( " +
+                        "    SELECT LEAST(start_node_id, end_node_id) AS a, " +
+                        "           GREATEST(start_node_id, end_node_id) AS b, " +
+                        "           SUM(flow_tph) AS sum_flow " +
+                        "    FROM physical_segment " +
+                        "    WHERE task_id = ? AND variant_id = ? " +
+                        "    GROUP BY 1, 2 " +
+                        "    HAVING COUNT(*) > 1 " +
+                        ") p " +
+                        "WHERE k.task_id = ? AND k.variant_id = ? " +
+                        "  AND LEAST(k.start_node_id, k.end_node_id) = p.a " +
+                        "  AND GREATEST(k.start_node_id, k.end_node_id) = p.b " +
+                        "  AND k.id = ( " +
+                        "        SELECT w.id FROM physical_segment w " +
+                        "        WHERE w.task_id = k.task_id AND w.variant_id = k.variant_id " +
+                        "          AND LEAST(w.start_node_id, w.end_node_id) = p.a " +
+                        "          AND GREATEST(w.start_node_id, w.end_node_id) = p.b " +
+                        "        ORDER BY w.flow_tph DESC, w.id ASC " +
+                        "        LIMIT 1)",
+                taskId, variantId, taskId, variantId);
+
+        // 2) удалить дубликаты (оставляем геометрию с наибольшим flow)
+        return jdbc.update(
+                "DELETE FROM physical_segment " +
+                        "WHERE task_id = ? AND variant_id = ? " +
+                        "  AND id IN ( " +
+                        "    SELECT id FROM ( " +
+                        "        SELECT id, ROW_NUMBER() OVER ( " +
+                        "            PARTITION BY LEAST(start_node_id, end_node_id), " +
+                        "                         GREATEST(start_node_id, end_node_id) " +
+                        "            ORDER BY flow_tph DESC, id ASC) AS rn " +
+                        "        FROM physical_segment " +
+                        "        WHERE task_id = ? AND variant_id = ? " +
+                        "    ) t WHERE rn > 1)",
+                taskId, variantId, taskId, variantId);
     }
 
     // ====================================================================
