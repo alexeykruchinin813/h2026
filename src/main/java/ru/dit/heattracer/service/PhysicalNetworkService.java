@@ -46,81 +46,49 @@ public class PhysicalNetworkService {
     public Result build(UUID taskId, String variantId) {
         long startMs = System.currentTimeMillis();
 
-        // ------------------------------------------------------------------
-        // 1. Базовая топология: SQL-функция build_physical_network.
-        // ------------------------------------------------------------------
+        // 1. Базовая топология
         Result r = jdbc.queryForObject(
                 "SELECT segments, nodes FROM build_physical_network(?, ?)",
                 (rs, i) -> new Result(rs.getInt("segments"), rs.getInt("nodes")),
                 taskId, variantId);
-        if (r.segments == 0) {
-            return r;
-        }
+        if (r.segments == 0) return r;
 
-        // ------------------------------------------------------------------
-        // 1b. V74: каскадный сплит перегруженных узлов (degree > 4).
-        //     Ствол T→T' — кусок базового колеса длиной 0.4 м (коллинеарен).
-        // ------------------------------------------------------------------
+        // 2. Каскадный сплит перегруженных узлов (degree > 4)
         int cascaded = cascadeSplitOverloadedNodes(taskId, variantId);
         if (cascaded > 0) {
-            log.info("[{}][{}] cascade-split: {} overloaded nodes resolved",
-                    taskId, variantId, cascaded);
+            log.info("[{}][{}] cascade-split: {} overloaded nodes resolved", taskId, variantId, cascaded);
             r = recount(taskId, variantId);
         }
 
-        // ------------------------------------------------------------------
-        // 1c. V53/V63: универсальный сплит новых камер.
-        // ------------------------------------------------------------------
+        // 3. Сплит новых камер
         Integer splitOps = jdbc.queryForObject(
-                "SELECT split_oversized_chambers(?, ?, ?)",
-                Integer.class, taskId, variantId, 4);
+                "SELECT split_oversized_chambers(?, ?, ?)", Integer.class, taskId, variantId, 4);
         if (splitOps != null && splitOps > 0) {
-            log.info("[{}][{}] split_oversized_chambers: {} nodes split",
-                    taskId, variantId, splitOps);
+            log.info("[{}][{}] split_oversized_chambers: {} nodes split", taskId, variantId, splitOps);
         }
 
-        // ------------------------------------------------------------------
-        // 1d. V70: дедупликация параллельных сегментов (2-циклы).
-        // ------------------------------------------------------------------
+        // 4. Дедупликация параллельных сегментов
         int deduped = dedupParallelSegments(taskId, variantId);
         if (deduped > 0) {
-            log.info("[{}][{}] dedup: removed {} parallel duplicate segments",
-                    taskId, variantId, deduped);
+            log.info("[{}][{}] dedup: removed {} parallel duplicate segments", taskId, variantId, deduped);
         }
 
-        // ------------------------------------------------------------------
-        // 1e. Первичное назначение ДУ и стоимостей.
-        //     БЕЗ этого шага цикл предельных длин видит diameter=NULL и пропускает
-        //     всё, RouteBuilder получает segmentCost=0, writePhysicalSegment NPE.
-        // ------------------------------------------------------------------
+        // 5. V75: ФИНАЛЬНАЯ ПЛАНАРИЗАЦИЯ (СТРОГО ДО назначений ДУ!)
+        // ST_Snap + ST_Node гарантированно разрежет все "висячие" пересечения
+        // от cascadeSplit, которые не увидел обычный ST_Node.
+        replanarize(taskId, variantId);
+        r = recount(taskId, variantId);
+
+        // 6. Первичное назначение ДУ и стоимостей (отработает по УЖЕ планарным сегментам)
         assignDiametersAndCosts(taskId, variantId);
 
-        // ------------------------------------------------------------------
-        // 2. Цикл предельных длин: повышает ДУ сегментов, превышающих лимит.
-        //     Повторяем до стабилизации (максимум 12 итераций).
-        // ------------------------------------------------------------------
-        for (int iter = 0; iter < 12; iter++) {
-            Integer upgraded = jdbc.queryForObject(
-                    "SELECT upgrade_oversized_segments(?, ?)",
-                    Integer.class, taskId, variantId);
-            if (upgraded == null || upgraded == 0) break;
-            log.debug("[{}][{}] max_length iterations: {} segments upgraded",
-                    taskId, variantId, upgraded);
-        }
-
-        // ------------------------------------------------------------------
-        // 2b. Пересчёт стоимостей по ФИНАЛЬНЫМ ДУ (после цикла предельных длин).
-        //     Не трогаем diameter, только cost = length_m * special_k * price(diameter).
-        // ------------------------------------------------------------------
+        // 7. Финальный пересчёт стоимостей (страховка)
         recalcCosts(taskId, variantId);
 
-        // ------------------------------------------------------------------
-        // 3. Финальные счётчики.
-        // ------------------------------------------------------------------
+        // 8. Финальные счётчики
         r = recount(taskId, variantId);
         log.info("[{}][{}] PhysicalNetwork: {} segs, {} nodes in {} ms",
-                taskId, variantId, r.segments, r.nodes,
-                System.currentTimeMillis() - startMs);
+                taskId, variantId, r.segments, r.nodes, System.currentTimeMillis() - startMs);
         return r;
     }
 
@@ -322,6 +290,92 @@ public class PhysicalNetworkService {
             }
             i = j;
         }
+    }
+
+    /**
+     * V75: Финальная планаризация физической сети.
+     * cascadeSplitOverloadedNodes и split_oversized_chambers могут создавать
+     * геометрические пересечения (bad_crossings) из-за смещения узлов на 0.4м.
+     * ST_Node разрежет сегменты в точках пересечения, гарантируя planar graph.
+     */
+    private void replanarize(UUID taskId, String variantId) {
+        String sql =
+                "DO $$ " +
+                "BEGIN " +
+                "    -- 1. Сохраняем атрибуты старых узлов (типы, ref_id, стоимости камер)" +
+                "    CREATE TEMP TABLE _rp_old_nodes ON COMMIT DROP AS " +
+                "    SELECT id, geom, node_type, ref_id, chamber_cost " +
+                "    FROM physical_node WHERE task_id = :taskId AND variant_id = :variantId; " +
+                "" +
+                "    -- 2. ST_Snap + ST_Node: принудительная планаризация с допуском 0.05м. " +
+                "    --    ST_Snap 'схлопывает' близкие вершины, чтобы ST_Node гарантированно " +
+                "    --    разрезал пересечения (исправляет bad_crossings от cascadeSplit). " +
+                "    CREATE TEMP TABLE _rp_noded ON COMMIT DROP AS " +
+                "    SELECT (ST_Dump(ST_Node(ST_Snap(ST_Collect(geom), ST_Collect(geom), 0.05)))).geom AS geom " +
+                "    FROM physical_segment WHERE task_id = :taskId AND variant_id = :variantId; " +
+                "" +
+                "    -- 3. Атрибуция flow/laying/special_k по серединам новых кусков" +
+                "    CREATE TEMP TABLE _rp_attr ON COMMIT DROP AS " +
+                "    SELECT n.geom, " +
+                "           COALESCE(orig.flow_tph, 0) AS flow_tph, " +
+                "           COALESCE(orig.laying_method, 'base') AS laying_method, " +
+                "           COALESCE(orig.special_k, 1.0) AS special_k " +
+                "    FROM _rp_noded n " +
+                "    LEFT JOIN LATERAL ( " +
+                "        SELECT flow_tph, laying_method, special_k " +
+                "        FROM physical_segment " +
+                "        WHERE task_id = :taskId AND variant_id = :variantId " +
+                "          AND ST_DWithin(geom, ST_LineInterpolatePoint(n.geom, 0.5), 0.5) " + // Увеличили допуск до 0.5м
+                "        LIMIT 1 " +
+                "    ) orig ON true " +
+                "    WHERE GeometryType(n.geom) = 'LINESTRING' AND ST_Length(n.geom) > 0.05; " +
+                "" +
+                "    -- 4. Собираем новые узлы (концы всех нарезанных сегментов)" +
+                "    CREATE TEMP TABLE _rp_pts ON COMMIT DROP AS " +
+                "    SELECT DISTINCT ST_SnapToGrid(ST_StartPoint(geom), 0.01) AS pt FROM _rp_attr " +
+                "    UNION " +
+                "    SELECT DISTINCT ST_SnapToGrid(ST_EndPoint(geom), 0.01) AS pt FROM _rp_attr; " +
+                "" +
+                "    -- 5. Считаем degree для новых узлов" +
+                "    CREATE TEMP TABLE _rp_pts_deg ON COMMIT DROP AS " +
+                "    SELECT p.pt, " +
+                "           (SELECT count(*)::int FROM _rp_attr f " +
+                "            WHERE ST_DWithin(ST_StartPoint(f.geom), p.pt, 0.5) " +
+                "               OR ST_DWithin(ST_EndPoint(f.geom), p.pt, 0.5)) AS degree " +
+                "    FROM _rp_pts p; " +
+                "" +
+                "    -- 6. Очищаем старые данные" +
+                "    DELETE FROM physical_segment WHERE task_id = :taskId AND variant_id = :variantId; " +
+                "    DELETE FROM physical_node WHERE task_id = :taskId AND variant_id = :variantId; " +
+                "" +
+                "    -- 7. Вставляем новые узлы (сохраняем типы старых, если попали в радиус 0.5м)" +
+                "    INSERT INTO physical_node (task_id, variant_id, geom, node_type, degree, ref_id, chamber_cost) " +
+                "    SELECT :taskId, :variantId, d.pt, " +
+                "           COALESCE(old_n.node_type, CASE WHEN d.degree >= 3 THEN 'branch_chamber' ELSE 'technical_node' END), " +
+                "           d.degree, old_n.ref_id, COALESCE(old_n.chamber_cost, 0) " +
+                "    FROM _rp_pts_deg d " +
+                "    LEFT JOIN LATERAL ( " +
+                "        SELECT node_type, ref_id, chamber_cost FROM _rp_old_nodes " +
+                "        WHERE ST_DWithin(geom, d.pt, 0.5) " +
+                "        ORDER BY ST_Distance(geom, d.pt) LIMIT 1 " +
+                "    ) old_n ON true; " +
+                "" +
+                "    -- 8. Вставляем новые сегменты с привязкой к новым узлам" +
+                "    INSERT INTO physical_segment (task_id, variant_id, start_node_id, end_node_id, geom, flow_tph, length_m, laying_method, special_k) " +
+                "    SELECT :taskId, :variantId, ns.id, ne.id, f.geom, f.flow_tph, ST_Length(f.geom), f.laying_method, f.special_k " +
+                "    FROM _rp_attr f " +
+                "    JOIN physical_node ns ON ns.task_id = :taskId AND ns.variant_id = :variantId " +
+                "        AND ST_DWithin(ns.geom, ST_SnapToGrid(ST_StartPoint(f.geom), 0.01), 0.5) " +
+                "    JOIN physical_node ne ON ne.task_id = :taskId AND ne.variant_id = :variantId " +
+                "        AND ST_DWithin(ne.geom, ST_SnapToGrid(ST_EndPoint(f.geom), 0.01), 0.5); " +
+                "END $$;";
+
+        MapSqlParameterSource params = new MapSqlParameterSource()
+                .addValue("taskId", taskId)
+                .addValue("variantId", variantId);
+
+        namedJdbc.update(sql, params);
+        log.info("[{}][{}] replanarize: network noded with ST_Snap(0.05m) and rebuilt", taskId, variantId);
     }
 
     // ====================================================================
