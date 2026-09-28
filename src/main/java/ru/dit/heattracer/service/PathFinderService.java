@@ -77,9 +77,7 @@ public class PathFinderService {
      */
     public List<PathResult> findPathsFromOks(UUID taskId, int clusterId, long oksVertex) {
         long start = System.currentTimeMillis();
-
         List<PathResult> results = new ArrayList<>();
-
         jdbc.query(
                 "SELECT vv.id AS target_vertex, " +
                         "       ST_AsText(p.path_geom) AS path_wkt, " +
@@ -90,10 +88,12 @@ public class PathFinderService {
                         "   AND vv.cluster_id = ? " +
                         "   AND vv.vertex_type = 'candidate' " +
                         "   AND p.edge_count > 0",
+                // V65: NOT EXISTS removed. В плотных кластерах этот фильтр
+                // блокировал все пути к edge_projection, оставляя OKS без
+                // reachable candidates. Планарность обеспечивается V63 + V53.
                 rs -> {
                     long target = rs.getLong("target_vertex");
                     String wkt = rs.getString("path_wkt");
-
                     java.sql.Array arr = rs.getArray("edge_ids");
                     List<Long> ids = new ArrayList<>();
                     if (arr != null) {
@@ -104,7 +104,6 @@ public class PathFinderService {
                             for (Object id : (Object[]) raw) ids.add(((Number) id).longValue());
                         }
                     }
-
                     results.add(new PathResult(
                             oksVertex, target,
                             toDouble(rs.getBigDecimal("total_cost")),
@@ -112,16 +111,11 @@ public class PathFinderService {
                             rs.getInt("edge_count"),
                             wkt, ids, true));
                 },
-                // Аргументы идут по порядку появления ? в SQL: сначала 4 параметра LATERAL-функции
-                // (task_id, cluster_id, from_vertex, to_vertex=vv.id — привязан к строке, не передаём),
-                // затем task_id и cluster_id для WHERE.
                 taskId, clusterId, oksVertex,
                 taskId, clusterId);
-
         long elapsed = System.currentTimeMillis() - start;
         log.info("[{}] Cluster {}: OKS vertex {} → {} paths found ({} ms)",
                 taskId, clusterId, oksVertex, results.size(), elapsed);
-
         return results;
     }
 

@@ -128,8 +128,10 @@ public class HybridVisibilityGraphService {
      * Вызывает SQL функцию для создания coarse-графа
      */
     private Map<String, Object> callSqlCoarseGraph(UUID taskId, int clusterId, int newDiameter) {
-        String sql = "SELECT * FROM build_visibility_graph(?, ?, ?, 120.0, 2500.0, 500.0, 400, 0.5, 2.0)";
-        
+        // V70: тюнинг связности графа видимости.
+        // Реально работают: p_r_max_corner (4-й), p_max_corners (7-й), p_simplify_tolerance (9-й).
+        // p_r_max_oks_corner (6-й) пока dead code в prosrc — оставлен как есть.
+        String sql = "SELECT * FROM build_visibility_graph(?, ?, ?, 180.0, 2500.0, 500.0, 800, 0.5, 1.0)";
         return jdbc.queryForObject(sql, (rs, rowNum) -> {
             Map<String, Object> result = new HashMap<>();
             result.put("vertices", rs.getLong("inserted_vertices"));
@@ -472,11 +474,14 @@ public class HybridVisibilityGraphService {
     }
 
     /**
-     * Определяет буфер OKS по диаметру трубы (ТЗ п. 3.2)
+     * Отступ OKS по ДУ, ТЗ таблица 2:
+     *   < 500 мм → 5,0 м
+     *   500–800 мм → 7,0 м
+     *   ≥ 900 мм → 9,0 м
      */
     private double getOksBufferByDiameter(int diameterMm) {
-        if (diameterMm <= 100) return 5.0;
-        if (diameterMm <= 200) return 7.0;
+        if (diameterMm < 500)  return 5.0;
+        if (diameterMm <= 800) return 7.0;
         return 9.0;
     }
 

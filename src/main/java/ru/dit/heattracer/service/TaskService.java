@@ -26,19 +26,28 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Comparator;
-import java.util.HashMap;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
-import java.util.UUID;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 
-
+/**
+ * Пайплайн обработки задачи: парсинг → валидация → граф → кластеризация →
+ * поиск путей A* → построение маршрутов (до 3 содержательно отличающихся
+ * вариантов) → дедупликация → ранжирование → экспорт GeoJSON.
+ *
+ * <p>P2.2 (ТЗ 2.8): три стратегии выбора точек врезки:
+ * <ul>
+ *   <li>v1 — individual: каждый OKS к своему ближайшему tie-in (min path cost);</li>
+ *   <li>v2 — shared: все OKS кластера используют один общий target;</li>
+ *   <li>v3 — sub-split: кластер делится на 2 подгруппы, каждая со своим shared target.</li>
+ * </ul>
+ * После построения — дедупликация по score (4 знака); на «чистом» наборе,
+ * где все стратегии дают одну конфигурацию, в GeoJSON останется 1 вариант.
+ *
+ * <p>V63 (Проблема B): три стратегии capacity-aware. Распределение OKS по
+ * точкам врезки координируется через {@link TieInCoordinationService},
+ * чтобы degree existing_tie_in не превышал 4 (ТЗ 2.3, 2.4).
+ */
 @Service
 public class TaskService {
 
@@ -61,6 +70,7 @@ public class TaskService {
     private final PathFinderService pathFinderService;
     private final DiameterPicker diameterPicker;
     private final RouteBuilderService routeBuilderService;
+    private final TieInCoordinationService tieInCoordinationService;
 
     public TaskService(
             @Qualifier("calcExecutor") Executor calcExecutor,
@@ -78,8 +88,9 @@ public class TaskService {
             HybridVisibilityGraphService hybridVisibilityGraphService,
             PathFinderService pathFinderService,
             DiameterPicker diameterPicker,
-            RouteBuilderService routeBuilderService
-            ) throws IOException {
+            RouteBuilderService routeBuilderService,
+            TieInCoordinationService tieInCoordinationService
+    ) throws IOException {
         this.calcExecutor = calcExecutor;
         this.storageRoot = Paths.get(storageDir);
         this.geoJsonReader = geoJsonReader;
@@ -96,6 +107,7 @@ public class TaskService {
         this.pathFinderService = pathFinderService;
         this.diameterPicker = diameterPicker;
         this.routeBuilderService = routeBuilderService;
+        this.tieInCoordinationService = tieInCoordinationService;
         Files.createDirectories(storageRoot);
         log.info("Storage root: {}", storageRoot.toAbsolutePath());
     }
@@ -215,10 +227,9 @@ public class TaskService {
             state.setStage("BUILDING_VISIBILITY");
             state.setPercent(88);
 
-            // Параллельная обработка кластеров (OPTIMIZATION: parallel stream)
-            // Используем гибридный подход (SQL + JTS) для решения проблемы связности в плотной застройке
             int clusterCount = clusters.size();
-            log.info("[{}] Building hybrid visibility graphs for {} clusters in parallel...", id, clusterCount);
+            log.info("[{}] Building hybrid visibility graphs for {} clusters in parallel...",
+                    id, clusterCount);
 
             clusters.parallelStream().forEach(cluster -> {
                 try {
@@ -231,7 +242,6 @@ public class TaskService {
                             provisionalSpec, cluster.getTotalFlow());
 
                     // HYBRID APPROACH: SQL coarse graph + JTS validation against individual polygons
-                    // Решает проблему разорванного графа при слиянии буферов OKS
                     VisibilityGraphResult vg = hybridVisibilityGraphService.buildHybrid(
                             id, cluster.getClusterId(), provisionalDiameter);
 
@@ -254,111 +264,112 @@ public class TaskService {
             int totalPaths = 0;
             int totalOksWithoutPath = 0;
 
+            // V64: собираем пути ВСЕХ кластеров до начала координации.
+            class ClusterPaths {
+                final OksCluster cluster;
+                final List<Long> oksVertexIds;
+                final Map<Long, List<PathResult>> allPaths;
+                ClusterPaths(OksCluster c, List<Long> ids, Map<Long, List<PathResult>> p) {
+                    this.cluster = c; this.oksVertexIds = ids; this.allPaths = p;
+                }
+            }
+
+            List<ClusterPaths> clusterPathsList = new ArrayList<>();
+            Set<Long> allTargetVertexIds = new HashSet<>();
+
             for (OksCluster cluster : clusters) {
-                // Получаем ID вершин-ОКС кластера
                 List<Long> oksVertexIds = jdbcTemplate.queryForList(
                         "SELECT id FROM visibility_vertex " +
                                 " WHERE task_id = ? AND cluster_id = ? AND vertex_type = 'oks' " +
                                 " ORDER BY id",
                         Long.class, id, cluster.getClusterId());
 
-                log.info("[{}] Cluster {}: {} OKS vertices",
-                        id, cluster.getClusterId(), oksVertexIds.size());
+                log.info("[{}] Cluster {}: {} OKS vertices", id, cluster.getClusterId(), oksVertexIds.size());
 
-                // P2.2: собираем все пути от каждого OKS, чтобы выбрать 3 стратегии
                 Map<Long, List<PathResult>> allPaths = new LinkedHashMap<>();
                 for (Long oksVertex : oksVertexIds) {
-                    List<PathResult> list = pathFinderService.findPathsFromOks(
-                            id, cluster.getClusterId(), oksVertex);
+                    List<PathResult> list = pathFinderService.findPathsFromOks(id, cluster.getClusterId(), oksVertex);
                     allPaths.put(oksVertex, list);
-                    log.info("[{}]   OKS {} → {} reachable candidates",
-                            id, oksVertex, list.size());
-                    if (list.isEmpty()) {
-                        totalOksWithoutPath++;
-                    }
+                    log.info("[{}]   OKS {} → {} reachable candidates", id, oksVertex, list.size());
+                    if (list.isEmpty()) totalOksWithoutPath++;
+                    for (PathResult p : list) allTargetVertexIds.add(p.getToVertex());
+                }
+                clusterPathsList.add(new ClusterPaths(cluster, oksVertexIds, allPaths));
+            }
+
+            // V64: одна capacity-карта на вариант, общая для всех кластеров.
+            TieInCoordinationService.CapacityState baseCap =
+                    tieInCoordinationService.computeCapacities(id, allTargetVertexIds);
+
+            TieInCoordinationService.CapacityState capV1 = baseCap.copy();
+            TieInCoordinationService.CapacityState capV2 = baseCap.copy();
+            TieInCoordinationService.CapacityState capV3 = baseCap.copy();
+
+            // Второй проход: назначаем с общей capacity-картой на вариант.
+            for (ClusterPaths cp : clusterPathsList) {
+                // v1: чистый SSP
+                Map<Long, PathResult> v1 = tieInCoordinationService.assignIndividual(
+                        cp.allPaths, capV1);
+
+                // v2: один shared target для всего кластера
+                Long sharedAll = tieInCoordinationService.pickSharedTarget(
+                        new HashSet<>(cp.oksVertexIds), cp.allPaths, capV2);
+                Set<Long> preferredV2 = sharedAll == null
+                        ? Collections.emptySet()
+                        : Collections.singleton(sharedAll);
+                Map<Long, PathResult> v2 = tieInCoordinationService.assignShared(
+                        new HashSet<>(cp.oksVertexIds), cp.allPaths, capV2, preferredV2);
+
+                // v3: два shared target (sub-split по X)
+                Map<Long, PathResult> v3;
+                if (cp.oksVertexIds.size() >= 4) {
+                    Map<Long, Double> oksX = new HashMap<>();
+                    jdbcTemplate.query(
+                            "SELECT id, ST_X(geom) AS x FROM visibility_vertex " +
+                                    "WHERE task_id = ? AND cluster_id = ? AND vertex_type = 'oks'",
+                            rs -> { oksX.put(rs.getLong("id"), rs.getDouble("x")); },
+                            id, cp.cluster.getClusterId());
+
+                    List<Long> sorted = new ArrayList<>(cp.oksVertexIds);
+                    sorted.sort(Comparator.comparingDouble(oksX::get));
+                    int mid = sorted.size() / 2;
+                    Set<Long> groupA = new HashSet<>(sorted.subList(0, mid));
+                    Set<Long> groupB = new HashSet<>(sorted.subList(mid, sorted.size()));
+
+                    Long sharedA = tieInCoordinationService.pickSharedTarget(groupA, cp.allPaths, capV3);
+                    Long sharedB = tieInCoordinationService.pickSharedTarget(groupB, cp.allPaths, capV3);
+                    Set<Long> preferredV3 = new HashSet<>();
+                    if (sharedA != null) preferredV3.add(sharedA);
+                    if (sharedB != null && !sharedB.equals(sharedA)) preferredV3.add(sharedB);
+
+                    v3 = tieInCoordinationService.assignSubSplit(
+                            cp.oksVertexIds, cp.allPaths, capV3, oksX, preferredV3);
+                } else {
+                    v3 = new LinkedHashMap<>(v1);
                 }
 
-                // v1: минимальная стоимость для каждого OKS
-                // v2: минимальная стоимость среди target != target(v1)
-                // v3: один общий target на кластер (min сумма)
-                Map<Long, PathResult> v1 = new LinkedHashMap<>();
-                Map<Long, PathResult> v2 = new LinkedHashMap<>();
-                for (Map.Entry<Long, List<PathResult>> e : allPaths.entrySet()) {
-                    Long oks = e.getKey();
-                    List<PathResult> sorted = new ArrayList<>(e.getValue());
-                    sorted.sort(Comparator.comparingDouble(PathResult::getTotalCost));
-                    if (sorted.isEmpty()) continue;
-
-                    PathResult best1 = sorted.get(0);
-                    v1.put(oks, best1);
-
-                    PathResult best2 = null;
-                    for (PathResult p : sorted) {
-                        if (p.getToVertex() != best1.getToVertex()) { best2 = p; break; }
-                    }
-                    v2.put(oks, best2 != null ? best2 : best1);   // нет альтернативы — тот же путь
-                }
-
-                // v3: target с минимальной суммой стоимостей путей ВСЕХ OKS кластера
-                Map<Long, Double> sumByTarget = new HashMap<>();
-                Map<Long, Integer> coverByTarget = new HashMap<>();
-                for (List<PathResult> list : allPaths.values()) {
-                    for (PathResult p : list) {
-                        sumByTarget.merge(p.getToVertex(), p.getTotalCost(), Double::sum);
-                        coverByTarget.merge(p.getToVertex(), 1, Integer::sum);
-                    }
-                }
-                long bestTarget = -1;
-                double bestSum = Double.MAX_VALUE;
-                int oksInCluster = allPaths.size();
-                for (Map.Entry<Long, Double> e : sumByTarget.entrySet()) {
-                    // Приоритет: покрытие всех OKS кластера; среди таких — минимальная сумма
-                    int cover = coverByTarget.getOrDefault(e.getKey(), 0);
-                    boolean fullCover = cover >= oksInCluster;
-                    boolean betterCover = bestTarget < 0
-                            || fullCover && coverByTarget.getOrDefault(bestTarget, 0) < oksInCluster;
-                    if (betterCover || (cover >= coverByTarget.getOrDefault(bestTarget, 0) && e.getValue() < bestSum)) {
-                        bestTarget = e.getKey();
-                        bestSum = e.getValue();
-                    }
-                }
-
-                Map<Long, PathResult> v3 = new LinkedHashMap<>();
-                for (Map.Entry<Long, List<PathResult>> e : allPaths.entrySet()) {
-                    PathResult chosen = null;
-                    for (PathResult p : e.getValue()) {
-                        if (p.getToVertex() == bestTarget) { chosen = p; break; }
-                    }
-                    if (chosen == null && !e.getValue().isEmpty()) {
-                        // OKS не достигает общего target — берём v1 (частичный результат)
-                        chosen = v1.get(e.getKey());
-                    }
-                    if (chosen != null) v3.put(e.getKey(), chosen);
-                }
-
-                // Сохраняем все три варианта в path_result
-                int clusterId = cluster.getClusterId();
-                for (Long oks : oksVertexIds) {
+                int clusterId = cp.cluster.getClusterId();
+                for (Long oks : cp.oksVertexIds) {
                     if (v1.containsKey(oks)) savePath(id, "v1", clusterId, oks, v1.get(oks));
                     if (v2.containsKey(oks)) savePath(id, "v2", clusterId, oks, v2.get(oks));
                     if (v3.containsKey(oks)) savePath(id, "v3", clusterId, oks, v3.get(oks));
                 }
-
                 totalPaths += v1.size();
             }
 
-            log.info("[{}] Total paths found: {}, OKS without path: {}",
-                    id, totalPaths, totalOksWithoutPath);
+            int totalOksInClusters = clusterPathsList.stream()
+                    .mapToInt(cp -> cp.oksVertexIds.size()).sum();
+            int totalDropped = totalOksInClusters - totalPaths;
 
-            // P1-1: метрика для теста HybridConnectivityIT (assert >= 15/17)
-            int oksTotal = totalPaths + totalOksWithoutPath;
-            System.out.printf("[P1-1 METRIC] ОКС с найденным путём: %d из %d%n",
-                    totalPaths, oksTotal);
+            log.info("[{}] OKS total={}, assigned={}, dropped_by_coordination={}, no_path={}",
+                    id, totalOksInClusters, totalPaths, totalDropped, totalOksWithoutPath);
+            System.out.printf("[P1-1 METRIC] ОКС с путём: %d из %d (dropped=%d, no_path=%d)%n",
+                    totalPaths, totalOksInClusters, totalDropped, totalOksWithoutPath);
 
             state.setPercent(92);
             state.setStage("PATHS_FOUND");
 
-            // ===== 8. ПОСТРОЕНИЕ МАРШРУТОВ (P2.2: три варианта) =====
+            // ===== 8. ПОСТРОЕНИЕ МАРШРУТОВ (три варианта) =====
             state.setStage("BUILDING_ROUTE");
             state.setPercent(93);
 
@@ -372,7 +383,33 @@ public class TaskService {
                 }
             }
 
-            // Ранжирование (ТЗ 2.8): по возрастанию score
+            // ===== Дедупликация вариантов по score (ТЗ 2.8) =====
+            // Если две стратегии дали идентичный score — оставляем только первую.
+            // Это гарантирует, что в GeoJSON все варианты содержательно отличаются.
+            List<String> uniqueVariants = new ArrayList<>();
+            Set<Double> seenScores = new HashSet<>();
+            for (String vid : variantIds) {
+                Double score = jdbcTemplate.queryForObject(
+                        "SELECT score FROM variant WHERE task_id = ? AND id = ?",
+                        Double.class, id, vid);
+                if (score == null) continue;
+                double rounded = Math.round(score * 10000.0) / 10000.0;
+                if (seenScores.contains(rounded)) {
+                    log.warn("[{}] Variant {} dropped: score={} identical to already kept",
+                            id, vid, rounded);
+                    jdbcTemplate.update("DELETE FROM path_result WHERE task_id = ? AND variant_id = ?",
+                            id, vid);
+                    jdbcTemplate.update("DELETE FROM variant_feature WHERE task_id = ? AND variant_id = ?",
+                            id, vid);
+                    jdbcTemplate.update("DELETE FROM variant WHERE task_id = ? AND id = ?",
+                            id, vid);
+                } else {
+                    seenScores.add(rounded);
+                    uniqueVariants.add(vid);
+                }
+            }
+
+            // Переранжирование после дедупликации (ТЗ 2.8: rank 1 = min score)
             jdbcTemplate.update(
                     "UPDATE variant v SET rank = sub.rn FROM ( " +
                             "  SELECT id, ROW_NUMBER() OVER (ORDER BY score ASC) AS rn " +
@@ -380,17 +417,47 @@ public class TaskService {
                             ") sub WHERE v.task_id = ? AND v.id = sub.id",
                     id, id);
 
-            log.info("[{}] Variants built and ranked: {}", id, variantIds);
+            // Синхронизируем rank в variant_summary.properties (иначе экспорт
+            // покажет хардкод 1 у всех вариантов)
+            jdbcTemplate.update(
+                    "UPDATE variant_feature vf SET properties = " +
+                            "  jsonb_set(vf.properties, '{rank}', to_jsonb(v.rank)) " +
+                            "FROM variant v " +
+                            "WHERE vf.task_id = ? AND vf.task_id = v.task_id " +
+                            "  AND vf.variant_id = v.id AND vf.object_type = 'variant_summary'",
+                    id);
 
-            // ===== 9. ЭКСПОРТ РЕЗУЛЬТАТА (только v1) =====
+            // Прозрачность: фиксируем причину удаления каждого отброшенного варианта
+            Set<String> dropped = new HashSet<>(variantIds);
+            uniqueVariants.forEach(dropped::remove);
+            if (!dropped.isEmpty()) {
+                log.warn("[{}] Variants dropped by dedup (same score): {} " +
+                                "— на плотном наборе разные стратегии дают идентичную конфигурацию",
+                        id, dropped);
+            }
+            log.info("[{}] Unique variants after dedup: {}", id, uniqueVariants);
+
+            // ===== 9. ЭКСПОРТ РЕЗУЛЬТАТА (все уникальные варианты) =====
             state.setStage("EXPORTING");
             state.setPercent(95);
 
             Path resultPath = state.getInputPath().getParent().resolve("result.geojson");
             long written = exportService.exportAllVariants(id, resultPath);
 
-            log.info("[{}] Result written: {} features (all variants) to {}", id, written, resultPath);
+            log.info("[{}] Result written: {} features (all variants) to {}",
+                    id, written, resultPath);
             state.setResultPath(resultPath);
+
+            try {
+                for (String vid : uniqueVariants) {
+                    Path variantFile = state.getInputPath().getParent()
+                            .resolve("result_" + vid + ".geojson");
+                    exportService.exportVariantFeatures(id, vid, variantFile);
+                }
+                log.info("[{}] Split variant files written to {}", id, state.getInputPath().getParent());
+            } catch (Exception ex) {
+                log.warn("[{}] Split variant export failed: {}", id, ex.getMessage());
+            }
 
             // ===== 10. ЗАВЕРШЕНИЕ =====
             state.setPercent(100);
@@ -456,6 +523,9 @@ public class TaskService {
                     taskId, variantId, oksVertex, e.getMessage());
         }
     }
+
+    // Метод pickSharedTarget удалён в V63: логика переехала в
+    // TieInCoordinationService.pickSharedTargetForGroup (capacity-aware).
 
     public Optional<TaskState> get(UUID id) {
         return Optional.ofNullable(tasks.get(id));

@@ -9,6 +9,14 @@ import ru.dit.heattracer.api.dto.UploadResponse;
 import ru.dit.heattracer.service.TaskService;
 import ru.dit.heattracer.service.TaskState;
 
+import org.springframework.core.io.ByteArrayResource;
+import org.springframework.core.io.Resource;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+
 import java.io.IOException;
 import java.util.UUID;
 
@@ -42,4 +50,28 @@ public class UploadController {
                 )))
                 .orElseGet(() -> ResponseEntity.notFound().build());
     }
+
+    /**
+     * Скачивание result.geojson для задачи.
+     * Возвращает FeatureCollection со всеми вариантами (раздел 7 ТЗ).
+     */
+    @GetMapping("/task/{taskId}/result")
+    public ResponseEntity<Resource> result(@PathVariable UUID taskId) throws IOException {
+        TaskState state = taskService.get(taskId).orElse(null);
+        if (state == null) {
+            return ResponseEntity.notFound().build();
+        }
+        Path path = state.getResultPath();
+        if (path == null || !Files.exists(path)) {
+            return ResponseEntity.notFound().build();
+        }
+        Resource resource = new ByteArrayResource(Files.readAllBytes(path));
+        return ResponseEntity.ok()
+                .header(HttpHeaders.CONTENT_DISPOSITION,
+                        "attachment; filename=\"result_" + taskId + ".geojson\"")
+                .contentType(MediaType.APPLICATION_JSON)
+                .contentLength(resource.contentLength())
+                .body(resource);
+    }
+
 }
