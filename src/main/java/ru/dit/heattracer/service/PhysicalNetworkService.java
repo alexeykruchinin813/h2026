@@ -91,10 +91,7 @@ public class PhysicalNetworkService {
                     taskId, variantId, deduped);
         }
 
-        // 5. V76: ТОЧЕЧНОЕ исправление пересечений от cascadeSplit.
-        //    Не пересоздаёт топологию — только разрезает пересекающиеся пары
-        //    через ST_LineLocatePoint + ST_LineSubstring.
-        //    OKS-узлы, tie-in, диаметры — всё сохраняется.
+        // 5. Точечное исправление пересечений (ST_Point и ST_LineString)
         int fixed = fixCrossings(taskId, variantId);
         if (fixed > 0) {
             log.info("[{}][{}] fixCrossings: {} crossing pairs resolved",
@@ -102,21 +99,33 @@ public class PhysicalNetworkService {
             r = recount(taskId, variantId);
         }
 
-        Long remainingCrossings = jdbc.queryForObject(
-                "SELECT count(*) FROM physical_segment a " +
-                        "JOIN physical_segment b ON a.task_id = b.task_id " +
-                        "  AND a.variant_id = b.variant_id AND a.id < b.id " +
-                        "WHERE a.task_id = ? AND a.variant_id = ? " +
-                        "  AND ST_Intersects(a.geom, b.geom) " +
-                        "  AND NOT ST_Touches(a.geom, b.geom)",
-                Long.class, taskId, variantId);
-        if (remainingCrossings != null && remainingCrossings > 0) {
-            log.error("[{}][{}] {} bad_crossings remain after fixCrossings",
-                    taskId, variantId, remainingCrossings);
+        // 5.5 Удаление вырожденных сегментов (создаются split-ом на почти-концах)
+        int dropped = dropZeroLengthSegments(taskId, variantId);
+        if (dropped > 0) {
+            log.info("[{}][{}] dropZeroLengthSegments: {} degenerate segments removed",
+                    taskId, variantId, dropped);
+            r = recount(taskId, variantId);
         }
 
-        // 6. Первичное назначение ДУ и стоимостей
+        // 5.6 Удаление осиротевших узлов (degree=0), оставшихся от удалённых сегментов
+        int orphans = jdbc.update(
+                "DELETE FROM physical_node pn " +
+                        "WHERE pn.task_id = ? AND pn.variant_id = ? " +
+                        "  AND NOT EXISTS (SELECT 1 FROM physical_segment s " +
+                        "                  WHERE s.task_id = pn.task_id AND s.variant_id = pn.variant_id " +
+                        "                    AND (s.start_node_id = pn.id OR s.end_node_id = pn.id))",
+                taskId, variantId);
+        if (orphans > 0) {
+            log.info("[{}][{}] removed {} orphaned nodes", taskId, variantId, orphans);
+            r = recount(taskId, variantId);
+        }
+
+        // 6. Первичное назначение ДУ и стоимостей сегментов
         assignDiametersAndCosts(taskId, variantId);
+
+        // 6.5 Стоимость камер (ТЗ 3.2) — ДОЛЖНА идти после assignDiametersAndCosts:
+        //     использует s.diameter для определения max_du
+        computeChamberCosts(taskId, variantId);
 
         // 7. Финальный пересчёт стоимостей (страховка)
         recalcCosts(taskId, variantId);
@@ -347,44 +356,116 @@ public class PhysicalNetworkService {
      */
     private int fixCrossings(UUID taskId, String variantId) {
         int total = 0;
-        for (int iter = 0; iter < 50; iter++) {
-            // Найти ОДНУ пересекающуюся пару (LIMIT 1 для безопасности)
+        for (int iter = 0; iter < 200; iter++) {
             List<Map<String, Object>> cross = jdbc.queryForList(
                     "SELECT a.id AS aid, b.id AS bid, " +
-                            "       ST_X(ST_Intersection(a.geom, b.geom)) AS ix, " +
-                            "       ST_Y(ST_Intersection(a.geom, b.geom)) AS iy " +
+                            "       ST_GeometryType(ST_Intersection(a.geom, b.geom)) AS cross_type " +
                             "FROM physical_segment a " +
                             "JOIN physical_segment b ON a.id < b.id " +
                             "  AND ST_Intersects(a.geom, b.geom) " +
                             "  AND NOT ST_Touches(a.geom, b.geom) " +
-                            "  AND ST_GeometryType(ST_Intersection(a.geom, b.geom)) = 'ST_Point'" +
                             "WHERE a.task_id = ? AND a.variant_id = ? " +
                             "LIMIT 1",
                     taskId, variantId);
-
             if (cross.isEmpty()) break;
 
             long aid = ((Number) cross.get(0).get("aid")).longValue();
             long bid = ((Number) cross.get(0).get("bid")).longValue();
-            double ix = ((Number) cross.get(0).get("ix")).doubleValue();
-            double iy = ((Number) cross.get(0).get("iy")).doubleValue();
+            String crossType = (String) cross.get(0).get("cross_type");
 
-            // Создать новый technical_node в точке пересечения
-            Long nodeId = jdbc.queryForObject(
-                    "INSERT INTO physical_node (task_id, variant_id, geom, node_type, degree) " +
-                            "VALUES (?, ?, ST_SetSRID(ST_MakePoint(?, ?), 32637), 'technical_node', 4) " +
-                            "RETURNING id",
-                    Long.class, taskId, variantId, ix, iy);
+            if ("ST_Point".equals(crossType)) {
+                // X-пересечение двух сегментов — старый путь.
+                double[] ixy = jdbc.queryForObject(
+                        "SELECT ST_X(ST_Intersection(a.geom, b.geom)) AS x, " +
+                                "       ST_Y(ST_Intersection(a.geom, b.geom)) AS y " +
+                                "FROM physical_segment a, physical_segment b " +
+                                "WHERE a.id = ? AND b.id = ?",
+                        (rs, i) -> new double[]{rs.getDouble("x"), rs.getDouble("y")},
+                        aid, bid);
+                long nodeId = insertTechnicalNode(taskId, variantId, ixy[0], ixy[1]);
+                splitSegmentAtPoint(taskId, variantId, aid, nodeId, ixy[0], ixy[1]);
+                splitSegmentAtPoint(taskId, variantId, bid, nodeId, ixy[0], ixy[1]);
+                total++;
+            } else {
+                // ST_LineString / ST_MultiLineString — коллинеарное наложение.
+                // Проходим по endpoint'ам пересечения и режем каждый сегмент,
+                // у которого endpoint строго внутри. Один сплит за итерацию —
+                // после splitSegmentAtPoint исходный id удалён, поэтому
+                // обязательно break + continue, чтобы перечитать пару.
 
-            // Разрезать оба сегмента в точке пересечения
-            splitSegmentAtPoint(taskId, variantId, aid, nodeId, ix, iy);
-            splitSegmentAtPoint(taskId, variantId, bid, nodeId, ix, iy);
+                List<Map<String, Object>> pts = jdbc.queryForList(
+                        "SELECT ST_X(p) AS x, ST_Y(p) AS y FROM ( " +
+                                "  SELECT (ST_DumpPoints(ST_Intersection(a.geom, b.geom))).geom AS p " +
+                                "  FROM physical_segment a, physical_segment b " +
+                                "  WHERE a.id = ? AND b.id = ? " +
+                                ") q",
+                        aid, bid);
 
-            total++;
-            log.debug("[{}][{}] fixCrossings iter {}: split segs {} & {} at ({}, {})",
-                    taskId, variantId, iter, aid, bid, ix, iy);
+                boolean didSplit = false;
+                // Сначала A.
+                for (Map<String, Object> pt : pts) {
+                    double px = ((Number) pt.get("x")).doubleValue();
+                    double py = ((Number) pt.get("y")).doubleValue();
+                    if (splitIfInterior(taskId, variantId, aid, px, py)) {
+                        didSplit = true;
+                        break;
+                    }
+                }
+                if (!didSplit) {
+                    // Потом B.
+                    for (Map<String, Object> pt : pts) {
+                        double px = ((Number) pt.get("x")).doubleValue();
+                        double py = ((Number) pt.get("y")).doubleValue();
+                        if (splitIfInterior(taskId, variantId, bid, px, py)) {
+                            didSplit = true;
+                            break;
+                        }
+                    }
+                }
+                if (!didSplit) {
+                    // Ни один endpoint не внутри — значит один сегмент целиком
+                    // лежит внутри другого. Это вырожденный случай: один из них
+                    // имеет нулевую или почти нулевую длину. Удаляем более короткий.
+                    Long shorter = jdbc.queryForObject(
+                            "SELECT CASE WHEN ST_Length(a.geom) <= ST_Length(b.geom) " +
+                                    "            THEN a.id ELSE b.id END " +
+                                    "FROM physical_segment a, physical_segment b " +
+                                    "WHERE a.id = ? AND b.id = ?",
+                            Long.class, aid, bid);
+                    jdbc.update("DELETE FROM physical_segment WHERE id = ?", shorter);
+                    log.warn("[{}][{}] fixCrossings: deleted fully-contained degenerate seg {}",
+                            taskId, variantId, shorter);
+                }
+
+                // После любой правки — прогон dedup: он съест появившиеся
+                // средние дубликаты (когда A и B после сплита совпали концами).
+                dedupParallelSegments(taskId, variantId);
+                total++;
+            }
         }
         return total;
+    }
+
+    private boolean splitIfInterior(UUID taskId, String variantId,
+                                    long segId, double px, double py) {
+        Double frac = jdbc.queryForObject(
+                "SELECT ST_LineLocatePoint(geom, ST_SetSRID(ST_MakePoint(?, ?), 32637)) " +
+                        "FROM physical_segment WHERE id = ?",
+                Double.class, px, py, segId);
+        if (frac == null || frac < 0.001 || frac > 0.999) return false;
+
+        long nodeId = insertTechnicalNode(taskId, variantId, px, py);
+        splitSegmentAtPoint(taskId, variantId, segId, nodeId, px, py);
+        return true;
+    }
+
+    private long insertTechnicalNode(UUID taskId, String variantId,
+                                     double x, double y) {
+        return jdbc.queryForObject(
+                "INSERT INTO physical_node (task_id, variant_id, geom, node_type, degree) " +
+                        "VALUES (?, ?, ST_SetSRID(ST_MakePoint(?, ?), 32637), 'technical_node', 4) " +
+                        "RETURNING id",
+                Long.class, taskId, variantId, x, y);
     }
 
     /**
@@ -447,12 +528,14 @@ public class PhysicalNetworkService {
     // ====================================================================
 
     private void computeChamberCosts(UUID taskId, String variantId) {
+        // (A) Новые камеры (new_terminal_chamber, branch_chamber).
+        //     Стоимость — по таблице 3.2 ТЗ, шаг от max(ДУ) примыкающих сегментов.
         jdbc.update(
                 "UPDATE physical_node pn SET chamber_cost = " +
                         "  CASE " +
-                        "    WHEN sub.max_du <= 200  THEN 3000000 " +
-                        "    WHEN sub.max_du <= 500  THEN 5000000 " +
-                        "    WHEN sub.max_du <= 1000 THEN 8000000 " +
+                        "    WHEN sub.max_du <= 200  THEN 3000000  " +
+                        "    WHEN sub.max_du <= 500  THEN 5000000  " +
+                        "    WHEN sub.max_du <= 1000 THEN 8000000  " +
                         "    ELSE 12000000 END " +
                         "FROM ( " +
                         "  SELECT n.id, MAX(s.diameter) AS max_du " +
@@ -465,6 +548,40 @@ public class PhysicalNetworkService {
                         "  GROUP BY n.id " +
                         ") sub WHERE pn.id = sub.id",
                 taskId, variantId);
+
+        // (B) Врезки в существующие камеры (existing_tie_in).
+        //     По разъяснению 13: каждый НОВЫЙ линейный участок, заканчивающийся
+        //     в существующей камере, — одна врезка стоимостью 5 000 000 руб.
+        //     Все сегменты в physical_segment — новые (existing network отдельно),
+        //     поэтому COUNT(s.id) = число врезок в эту камеру.
+        jdbc.update(
+                "UPDATE physical_node pn SET chamber_cost = sub.cnt * 5000000 " +
+                        "FROM ( " +
+                        "  SELECT n.id, COUNT(s.id)::bigint AS cnt " +
+                        "  FROM physical_node n " +
+                        "  JOIN physical_segment s " +
+                        "    ON s.task_id = n.task_id AND s.variant_id = n.variant_id " +
+                        "   AND (s.start_node_id = n.id OR s.end_node_id = n.id) " +
+                        "  WHERE n.task_id = ? AND n.variant_id = ? " +
+                        "    AND n.node_type = 'existing_tie_in' " +
+                        "  GROUP BY n.id " +
+                        ") sub WHERE pn.id = sub.id",
+                taskId, variantId);
+
+        // Диагностика: посчитать и залогировать результат.
+        Map<String, Object> sums = jdbc.queryForMap(
+                "SELECT " +
+                        "  COALESCE(SUM(chamber_cost) FILTER (WHERE node_type IN " +
+                        "    ('new_terminal_chamber','branch_chamber')), 0) AS new_cost, " +
+                        "  COALESCE(SUM(chamber_cost) FILTER (WHERE node_type = 'existing_tie_in'), 0) AS tiein_cost, " +
+                        "  COUNT(*) FILTER (WHERE node_type IN ('new_terminal_chamber','branch_chamber')) AS new_cnt, " +
+                        "  COUNT(*) FILTER (WHERE node_type = 'existing_tie_in') AS tiein_cnt " +
+                        "FROM physical_node WHERE task_id = ? AND variant_id = ?",
+                taskId, variantId);
+        log.info("[{}][{}] computeChamberCosts: new chambers={} ({} ₽), tie-ins={} ({} ₽)",
+                taskId, variantId,
+                sums.get("new_cnt"), sums.get("new_cost"),
+                sums.get("tiein_cnt"), sums.get("tiein_cost"));
     }
 
     // ====================================================================
@@ -746,6 +863,13 @@ public class PhysicalNetworkService {
             total++;
         }
         return total;
+    }
+
+    private int dropZeroLengthSegments(UUID taskId, String variantId) {
+        return jdbc.update(
+                "DELETE FROM physical_segment " +
+                        "WHERE task_id = ? AND variant_id = ? AND ST_Length(geom) < 0.01",
+                taskId, variantId);
     }
 
     public static class Result {
