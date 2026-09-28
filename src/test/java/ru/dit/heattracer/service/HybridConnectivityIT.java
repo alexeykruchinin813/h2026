@@ -534,24 +534,6 @@ class HybridConnectivityIT extends BasePostgresIntegrationTest {
             }
 
         } catch (Exception e) {
-            jdbcTemplate.queryForList(
-                    "SELECT a.variant_id, a.id AS aid, b.id AS bid, " +
-                            "       ST_GeometryType(ST_Intersection(a.geom, b.geom)) AS cross_type, " +
-                            "       ST_AsText(ST_Intersection(a.geom, b.geom)) AS cross_wkt, " +
-                            "       ST_AsText(a.geom) AS a_wkt, ST_AsText(b.geom) AS b_wkt, " +
-                            "       a.start_node_id AS a_s, a.end_node_id AS a_e, " +
-                            "       b.start_node_id AS b_s, b.end_node_id AS b_e, " +
-                            "       ROUND(ST_Length(a.geom)::numeric, 3) AS a_len, " +
-                            "       ROUND(ST_Length(b.geom)::numeric, 3) AS b_len, " +
-                            "       a.flow_tph AS a_flow, b.flow_tph AS b_flow " +
-                            "FROM physical_segment a " +
-                            "JOIN physical_segment b ON a.task_id = b.task_id " +
-                            "  AND a.variant_id = b.variant_id AND a.id < b.id " +
-                            "WHERE a.task_id = ? " +
-                            "  AND ST_Intersects(a.geom, b.geom) " +
-                            "  AND NOT ST_Touches(a.geom, b.geom) " +
-                            "ORDER BY a.variant_id, a.id, b.id",
-                    currentTaskId).forEach(r -> sb.append("[bad_all] ").append(r).append("\n"));
             sb.append("[diag_error] ").append(e.getMessage()).append("\n");
         }
 
