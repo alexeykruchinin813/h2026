@@ -102,6 +102,19 @@ public class PhysicalNetworkService {
             r = recount(taskId, variantId);
         }
 
+        Long remainingCrossings = jdbc.queryForObject(
+                "SELECT count(*) FROM physical_segment a " +
+                        "JOIN physical_segment b ON a.task_id = b.task_id " +
+                        "  AND a.variant_id = b.variant_id AND a.id < b.id " +
+                        "WHERE a.task_id = ? AND a.variant_id = ? " +
+                        "  AND ST_Intersects(a.geom, b.geom) " +
+                        "  AND NOT ST_Touches(a.geom, b.geom)",
+                Long.class, taskId, variantId);
+        if (remainingCrossings != null && remainingCrossings > 0) {
+            log.error("[{}][{}] {} bad_crossings remain after fixCrossings",
+                    taskId, variantId, remainingCrossings);
+        }
+
         // 6. Первичное назначение ДУ и стоимостей
         assignDiametersAndCosts(taskId, variantId);
 
@@ -690,9 +703,9 @@ public class PhysicalNetworkService {
                             "FROM physical_node a " +
                             "JOIN physical_node b ON a.id < b.id " +
                             "  AND a.task_id = b.task_id AND a.variant_id = b.variant_id " +
-                            "  AND ST_DWithin(a.geom, b.geom, 0.05) " +   // 5 см
+                            "  AND ST_DWithin(a.geom, b.geom, 0.05) " +
                             "WHERE a.task_id = ? AND a.variant_id = ? " +
-                            "  AND NOT (a.node_type = 'oks' AND b.node_type = 'oks') " + // OKS не сливаем между собой
+                            "  AND NOT (a.node_type = 'oks' AND b.node_type = 'oks') " +
                             "LIMIT 1",
                     taskId, variantId);
 
@@ -701,16 +714,34 @@ public class PhysicalNetworkService {
             long keepId = ((Number) pair.get(0).get("keep_id")).longValue();
             long dropId = ((Number) pair.get(0).get("drop_id")).longValue();
 
-            // 1) перенаправить FK всех сегментов с drop на keep
+            // Запомнить позицию keep ДО UPDATE — нужна для снапа геометрии.
+            String keepWkt = jdbc.queryForObject(
+                    "SELECT ST_AsText(geom) FROM physical_node WHERE id = ?",
+                    String.class, keepId);
+
+            // Шаг 1: снап геометрии всех сегментов, висящих на drop, в точку keep.
+            jdbc.update(
+                    "UPDATE physical_segment SET geom = CASE " +
+                            "  WHEN start_node_id = ? THEN ST_SetPoint(geom, 0, ST_GeomFromText(?, 32637)) " +
+                            "  WHEN end_node_id   = ? THEN ST_SetPoint(geom, ST_NumPoints(geom) - 1, ST_GeomFromText(?, 32637)) " +
+                            "  ELSE geom END " +
+                            "WHERE task_id = ? AND variant_id = ? " +
+                            "  AND (start_node_id = ? OR end_node_id = ?)",
+                    dropId, keepWkt, dropId, keepWkt,
+                    taskId, variantId, dropId, dropId);
+
+            // Шаг 2: перенаправить FK + пересчитать length_m по уже снапнутой geom.
             jdbc.update(
                     "UPDATE physical_segment SET " +
                             "  start_node_id = CASE WHEN start_node_id = ? THEN ? ELSE start_node_id END, " +
-                            "  end_node_id   = CASE WHEN end_node_id   = ? THEN ? ELSE end_node_id   END " +
+                            "  end_node_id   = CASE WHEN end_node_id   = ? THEN ? ELSE end_node_id END, " +
+                            "  length_m = ST_Length(geom) " +
                             "WHERE task_id = ? AND variant_id = ? " +
                             "  AND (start_node_id = ? OR end_node_id = ?)",
-                    dropId, keepId, dropId, keepId, taskId, variantId, dropId, dropId);
+                    dropId, keepId, dropId, keepId,
+                    taskId, variantId, dropId, dropId);
 
-            // 2) удалить дубль-узел
+            // Шаг 3: удалить drop-узел.
             jdbc.update("DELETE FROM physical_node WHERE id = ?", dropId);
             total++;
         }
