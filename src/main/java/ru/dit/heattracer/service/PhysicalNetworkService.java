@@ -467,7 +467,7 @@ public class PhysicalNetworkService {
                 // при OFFSET=0 ST_SetPoint — no-op, но гарантирует ТЗ 7.2,
                 // если координаты узла когда-либо снапнулись).
                 for (Long sid : move) {
-                    jdbc.update(
+                    int moved = jdbc.update(
                             "UPDATE physical_segment SET " +
                                     "  start_node_id = CASE WHEN start_node_id = ? THEN ? ELSE start_node_id END, " +
                                     "  end_node_id   = CASE WHEN end_node_id   = ? THEN ? ELSE end_node_id   END, " +
@@ -476,6 +476,10 @@ public class PhysicalNetworkService {
                                     "         ELSE ST_SetPoint(geom, ST_NumPoints(geom) - 1, ST_SetSRID(ST_MakePoint(?, ?), 32637)) END " +
                                     "WHERE id = ?",
                             t, t2, t, t2, t, x, y, x, y, sid);
+                    if (moved != 1) {
+                        log.error("[{}][{}] cascade-split: UPDATE seg {} affected {} rows — parameter misalignment!",
+                                taskId, variantId, sid, moved);
+                    }
                     jdbc.update("UPDATE physical_segment SET length_m = ST_Length(geom) WHERE id = ?", sid);
                 }
 
