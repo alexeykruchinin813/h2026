@@ -139,8 +139,8 @@ public class PhysicalNetworkService {
      * Не переназначает diameter — только cost = length_m * special_k * price.
      */
     private void recalcCosts(UUID taskId, String variantId) {
-        jdbc.update(
-                "UPDATE physical_segment s SET cost = s.length_m * s.special_k * " +
+        int updated = jdbc.update(
+                "UPDATE physical_segment s SET cost = s.length_m * COALESCE(s.special_k, 1.0) * " +
                         "  CASE WHEN s.diameter <= 100 THEN 3780.0  WHEN s.diameter <= 125 THEN 4050.0 " +
                         "       WHEN s.diameter <= 150 THEN 4590.0  WHEN s.diameter <= 200 THEN 5580.0 " +
                         "       WHEN s.diameter <= 250 THEN 6840.0  WHEN s.diameter <= 300 THEN 8370.0 " +
@@ -151,6 +151,15 @@ public class PhysicalNetworkService {
                         "       ELSE 39330.0 END " +
                         "WHERE s.task_id = ? AND s.variant_id = ? AND s.diameter IS NOT NULL",
                 taskId, variantId);
+        log.info("[{}][{}] recalcCosts: updated {} segments", taskId, variantId, updated);
+
+        // Диагностика: проверить, что стоимости не NULL
+        Integer nullCost = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM physical_segment WHERE task_id = ? AND variant_id = ? AND cost IS NULL",
+                Integer.class, taskId, variantId);
+        if (nullCost != null && nullCost > 0) {
+            log.error("[{}][{}] recalcCosts: {} segments still have NULL cost!", taskId, variantId, nullCost);
+        }
     }
 
     private int dedupParallelSegments(UUID taskId, String variantId) {
