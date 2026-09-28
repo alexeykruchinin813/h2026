@@ -396,29 +396,17 @@ public class PhysicalNetworkService {
     }
 
     /**
-     * V69: каскадный сплит перегруженных узлов (degree > 4).
-     *
-     * Заменяет "звезду" на цепочку co-located камер:
-     *   T (deg=4) ←trunk→ T' (deg≤4) ← ... → T'' (deg≤4)
-     *
-     * Хвостовые сегменты переносятся на T', смещённую на 0.5 м вдоль
-     * среднего направления переносимых сегментов. Геометрии синхронизируются
-     * с узлами (ТЗ 7.2), длины пересчитываются, ДУ/стоимость делегируются
-     * проходу assignDiametersAndCosts.
-     *
-     * V71: base-first ORDER BY. Базовые сегменты (совпадающие с graph_edge)
-     * гарантированно остаются у T. Раньше полагались на порядок вставки
-     * в build_physical_network — на датасете это оказалось неверным
-     * (WARN "first segment is NOT base" срабатывал на всех вариантах).
+     * V69+V73: каскадный сплит перегруженных узлов (degree > 4).
+     * T' создаётся CO-LOCATED с T (OFFSET = 0) и БЕЗ ствола T→T':
+     * связанные только по FK co-located камеры — доказанная рабочая модель
+     * (дети split_oversized_chambers, V53/V63): в исходном прогоне с ними
+     * null_diam=0 и bad_crossings=0. Нулевой ствол ломал V46 (LINESTRING EMPTY)
+     * и гидравлический обход (null_diam=63), ненулевой (OFFSET>0) — давал
+     * изгибы хвостов и ST_MultiPoint-пересечения.
      */
     private int cascadeSplitOverloadedNodes(UUID taskId, String variantId) {
         final int MAX_ITER = 8;
-        final int KEEP = 3;         // сколько сегментов оставляем у T
-        // TODO V68: заменить на ST_Node-планаризацию (ветка st_split).
-        // Временно OFFSET=0: T' co-located с T, ствол нулевой длины.
-        // Это убирает новые пересечения от cascade, но оставляет "две камеры в одной точке".
-        // Плановое решение — planarize_physical_network через ST_Node.
-        final double OFFSET = 0.0;  // смещение T' от T, м
+        final int KEEP = 3;
         int total = 0;
 
         for (int iter = 0; iter < MAX_ITER; iter++) {
@@ -443,8 +431,7 @@ public class PhysicalNetworkService {
                 double y = ((Number) row.get("y")).doubleValue();
                 int deg = ((Number) row.get("deg")).intValue();
 
-                // V71: base-first — базовые сегменты (совпадающие с graph_edge)
-                // идут первыми и гарантированно остаются у T в KEEP.
+                // Base-first: базовые сегменты оставляем у T.
                 List<Long> segs = jdbc.queryForList(
                         "SELECT s.id FROM physical_segment s " +
                                 "WHERE s.task_id = ? AND s.variant_id = ? " +
@@ -456,7 +443,6 @@ public class PhysicalNetworkService {
                         Long.class, taskId, variantId, t, t);
                 if (segs.size() <= 4) continue;
 
-                // Страховочный assert: первый сегмент должен быть базовым.
                 Boolean firstIsBase = jdbc.queryForObject(
                         "SELECT EXISTS (SELECT 1 FROM graph_edge ge " +
                                 "                WHERE ge.task_id = ? AND ST_DWithin(ge.geom, " +
@@ -469,29 +455,17 @@ public class PhysicalNetworkService {
                 }
 
                 List<Long> move = new ArrayList<>(segs.subList(KEEP, segs.size()));
-                Long[] moveArr = move.toArray(new Long[0]);
 
-                // Направление на T': средний вектор к дальним концам переносимых сегментов.
-                double[] d = jdbc.queryForObject(
-                        "SELECT COALESCE(AVG(dx), 1.0) AS dx, COALESCE(AVG(dy), 0.0) AS dy FROM (" +
-                                "  SELECT ST_X(ST_PointN(geom, CASE WHEN start_node_id = ? THEN ST_NumPoints(geom) ELSE 1 END)) - ? AS dx, " +
-                                "         ST_Y(ST_PointN(geom, CASE WHEN start_node_id = ? THEN ST_NumPoints(geom) ELSE 1 END)) - ? AS dy " +
-                                "  FROM physical_segment WHERE id = ANY (?) ) v",
-                        (rs, i) -> new double[]{rs.getDouble("dx"), rs.getDouble("dy")},
-                        t, x, t, y, moveArr);
-                double len = Math.hypot(d[0], d[1]);
-                if (len < 1e-9) { d[0] = 1; d[1] = 0; len = 1; }
-                double tx = x + OFFSET * d[0] / len;
-                double ty = y + OFFSET * d[1] / len;
-
-                // Создаём T' (branch_chamber)
+                // T' в той же точке, что и T. БЕЗ INSERT ствола.
                 Long t2 = jdbc.queryForObject(
                         "INSERT INTO physical_node (task_id, variant_id, node_type, geom) " +
                                 "VALUES (?, ?, 'branch_chamber', ST_SetSRID(ST_MakePoint(?, ?), 32637)) " +
                                 "RETURNING id",
-                        Long.class, taskId, variantId, tx, ty);
+                        Long.class, taskId, variantId, x, y);
 
-                // Переносим сегменты: FK + геометрия (ТЗ 7.2) + длина.
+                // Переносим сегменты на T' (FK + страховка синхронизации геометрии;
+                // при OFFSET=0 ST_SetPoint — no-op, но гарантирует ТЗ 7.2,
+                // если координаты узла когда-либо снапнулись).
                 for (Long sid : move) {
                     jdbc.update(
                             "UPDATE physical_segment SET " +
@@ -501,29 +475,13 @@ public class PhysicalNetworkService {
                                     "         THEN ST_SetPoint(geom, 0, ST_SetSRID(ST_MakePoint(?, ?), 32637)) " +
                                     "         ELSE ST_SetPoint(geom, ST_NumPoints(geom) - 1, ST_SetSRID(ST_MakePoint(?, ?), 32637)) END " +
                                     "WHERE id = ?",
-                            t, t2, t, t2, t, tx, ty, tx, ty, sid);
+                            t, t2, t, t2, t, x, y, x, y, sid);
                     jdbc.update("UPDATE physical_segment SET length_m = ST_Length(geom) WHERE id = ?", sid);
                 }
 
-                // Ствол T -> T'. length_m вычисляется инлайн (NOT NULL).
-                // diameter/cost оставляем NULL — их проставит assignDiametersAndCosts.
-                Double trunkFlow = jdbc.queryForObject(
-                        "SELECT COALESCE(SUM(flow_tph), 0) FROM physical_segment WHERE id = ANY (?)",
-                        Double.class, (Object) moveArr);
-                jdbc.update(
-                        "INSERT INTO physical_segment " +
-                                "  (task_id, variant_id, start_node_id, end_node_id, flow_tph, " +
-                                "   laying_method, geom, length_m) " +
-                                "VALUES (?, ?, ?, ?, ?, 'base', " +
-                                "        ST_SetSRID(ST_MakeLine(ST_MakePoint(?, ?), ST_MakePoint(?, ?)), 32637), " +
-                                "        ST_Length(ST_SetSRID(ST_MakeLine(ST_MakePoint(?, ?), ST_MakePoint(?, ?)), 32637)))",
-                        taskId, variantId, t, t2, trunkFlow,
-                        x, y, tx, ty,
-                        x, y, tx, ty);
-
                 total++;
-                log.info("[{}][{}] cascade-split iter {}: node {} (deg={}) -> T'={} (moved {} segs, trunk flow={})",
-                        taskId, variantId, iter, t, deg, t2, move.size(), trunkFlow);
+                log.info("[{}][{}] cascade-split iter {}: node {} (deg={}) -> T'={} (moved {} segs, no trunk)",
+                        taskId, variantId, iter, t, deg, t2, move.size());
             }
         }
         return total;
