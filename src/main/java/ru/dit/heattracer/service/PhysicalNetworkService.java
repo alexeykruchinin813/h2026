@@ -56,30 +56,39 @@ public class PhysicalNetworkService {
         // 2. Каскадный сплит перегруженных узлов (degree > 4)
         int cascaded = cascadeSplitOverloadedNodes(taskId, variantId);
         if (cascaded > 0) {
-            log.info("[{}][{}] cascade-split: {} overloaded nodes resolved", taskId, variantId, cascaded);
+            log.info("[{}][{}] cascade-split: {} overloaded nodes resolved",
+                    taskId, variantId, cascaded);
             r = recount(taskId, variantId);
         }
 
         // 3. Сплит новых камер
         Integer splitOps = jdbc.queryForObject(
-                "SELECT split_oversized_chambers(?, ?, ?)", Integer.class, taskId, variantId, 4);
+                "SELECT split_oversized_chambers(?, ?, ?)",
+                Integer.class, taskId, variantId, 4);
         if (splitOps != null && splitOps > 0) {
-            log.info("[{}][{}] split_oversized_chambers: {} nodes split", taskId, variantId, splitOps);
+            log.info("[{}][{}] split_oversized_chambers: {} nodes split",
+                    taskId, variantId, splitOps);
         }
 
         // 4. Дедупликация параллельных сегментов
         int deduped = dedupParallelSegments(taskId, variantId);
         if (deduped > 0) {
-            log.info("[{}][{}] dedup: removed {} parallel duplicate segments", taskId, variantId, deduped);
+            log.info("[{}][{}] dedup: removed {} parallel duplicate segments",
+                    taskId, variantId, deduped);
         }
 
-        // 5. V75: ФИНАЛЬНАЯ ПЛАНАРИЗАЦИЯ (СТРОГО ДО назначений ДУ!)
-        // ST_Snap + ST_Node гарантированно разрежет все "висячие" пересечения
-        // от cascadeSplit, которые не увидел обычный ST_Node.
-        replanarize(taskId, variantId);
-        r = recount(taskId, variantId);
+        // 5. V76: ТОЧЕЧНОЕ исправление пересечений от cascadeSplit.
+        //    Не пересоздаёт топологию — только разрезает пересекающиеся пары
+        //    через ST_LineLocatePoint + ST_LineSubstring.
+        //    OKS-узлы, tie-in, диаметры — всё сохраняется.
+        int fixed = fixCrossings(taskId, variantId);
+        if (fixed > 0) {
+            log.info("[{}][{}] fixCrossings: {} crossing pairs resolved",
+                    taskId, variantId, fixed);
+            r = recount(taskId, variantId);
+        }
 
-        // 6. Первичное назначение ДУ и стоимостей (отработает по УЖЕ планарным сегментам)
+        // 6. Первичное назначение ДУ и стоимостей
         assignDiametersAndCosts(taskId, variantId);
 
         // 7. Финальный пересчёт стоимостей (страховка)
@@ -88,7 +97,8 @@ public class PhysicalNetworkService {
         // 8. Финальные счётчики
         r = recount(taskId, variantId);
         log.info("[{}][{}] PhysicalNetwork: {} segs, {} nodes in {} ms",
-                taskId, variantId, r.segments, r.nodes, System.currentTimeMillis() - startMs);
+                taskId, variantId, r.segments, r.nodes,
+                System.currentTimeMillis() - startMs);
         return r;
     }
 
@@ -293,89 +303,114 @@ public class PhysicalNetworkService {
     }
 
     /**
-     * V75: Финальная планаризация физической сети.
-     * cascadeSplitOverloadedNodes и split_oversized_chambers могут создавать
-     * геометрические пересечения (bad_crossings) из-за смещения узлов на 0.4м.
-     * ST_Node разрежет сегменты в точках пересечения, гарантируя planar graph.
+     * V76: Точечное исправление пересечений сегментов (ТЗ 2.1).
+     * <p>
+     * cascadeSplitOverloadedNodes может создать геометрические пересечения
+     * из-за смещения узлов на TRUNK_LEN=0.4м. Этот метод находит каждую
+     * пересекающуюся пару и разрезает оба сегмента в точке пересечения
+     * через ST_LineLocatePoint + ST_LineSubstring, создавая новый
+     * technical_node.
+     * <p>
+     * В отличие от replanarize (ST_Snap + ST_Node), этот метод:
+     * <ul>
+     *   <li>НЕ пересоздаёт топологию — OKS/tie-in узлы не теряются;</li>
+     *   <li>НЕ использует ST_Snap — нет сдвига координат на 5 см;</li>
+     *   <li>Работает итеративно — каждое пересечение исправляется отдельно.</li>
+     * </ul>
      */
-    private void replanarize(UUID taskId, String variantId) {
-        String sql =
-                "DO $$ " +
-                "BEGIN " +
-                "    -- 1. Сохраняем атрибуты старых узлов (типы, ref_id, стоимости камер)" +
-                "    CREATE TEMP TABLE _rp_old_nodes ON COMMIT DROP AS " +
-                "    SELECT id, geom, node_type, ref_id, chamber_cost " +
-                "    FROM physical_node WHERE task_id = :taskId AND variant_id = :variantId; " +
-                "" +
-                "    -- 2. ST_Snap + ST_Node: принудительная планаризация с допуском 0.05м. " +
-                "    --    ST_Snap 'схлопывает' близкие вершины, чтобы ST_Node гарантированно " +
-                "    --    разрезал пересечения (исправляет bad_crossings от cascadeSplit). " +
-                "    CREATE TEMP TABLE _rp_noded ON COMMIT DROP AS " +
-                "    SELECT (ST_Dump(ST_Node(ST_Snap(ST_Collect(geom), ST_Collect(geom), 0.05)))).geom AS geom " +
-                "    FROM physical_segment WHERE task_id = :taskId AND variant_id = :variantId; " +
-                "" +
-                "    -- 3. Атрибуция flow/laying/special_k по серединам новых кусков" +
-                "    CREATE TEMP TABLE _rp_attr ON COMMIT DROP AS " +
-                "    SELECT n.geom, " +
-                "           COALESCE(orig.flow_tph, 0) AS flow_tph, " +
-                "           COALESCE(orig.laying_method, 'base') AS laying_method, " +
-                "           COALESCE(orig.special_k, 1.0) AS special_k " +
-                "    FROM _rp_noded n " +
-                "    LEFT JOIN LATERAL ( " +
-                "        SELECT flow_tph, laying_method, special_k " +
-                "        FROM physical_segment " +
-                "        WHERE task_id = :taskId AND variant_id = :variantId " +
-                "          AND ST_DWithin(geom, ST_LineInterpolatePoint(n.geom, 0.5), 0.5) " + // Увеличили допуск до 0.5м
-                "        LIMIT 1 " +
-                "    ) orig ON true " +
-                "    WHERE GeometryType(n.geom) = 'LINESTRING' AND ST_Length(n.geom) > 0.05; " +
-                "" +
-                "    -- 4. Собираем новые узлы (концы всех нарезанных сегментов)" +
-                "    CREATE TEMP TABLE _rp_pts ON COMMIT DROP AS " +
-                "    SELECT DISTINCT ST_SnapToGrid(ST_StartPoint(geom), 0.01) AS pt FROM _rp_attr " +
-                "    UNION " +
-                "    SELECT DISTINCT ST_SnapToGrid(ST_EndPoint(geom), 0.01) AS pt FROM _rp_attr; " +
-                "" +
-                "    -- 5. Считаем degree для новых узлов" +
-                "    CREATE TEMP TABLE _rp_pts_deg ON COMMIT DROP AS " +
-                "    SELECT p.pt, " +
-                "           (SELECT count(*)::int FROM _rp_attr f " +
-                "            WHERE ST_DWithin(ST_StartPoint(f.geom), p.pt, 0.5) " +
-                "               OR ST_DWithin(ST_EndPoint(f.geom), p.pt, 0.5)) AS degree " +
-                "    FROM _rp_pts p; " +
-                "" +
-                "    -- 6. Очищаем старые данные" +
-                "    DELETE FROM physical_segment WHERE task_id = :taskId AND variant_id = :variantId; " +
-                "    DELETE FROM physical_node WHERE task_id = :taskId AND variant_id = :variantId; " +
-                "" +
-                "    -- 7. Вставляем новые узлы (сохраняем типы старых, если попали в радиус 0.5м)" +
-                "    INSERT INTO physical_node (task_id, variant_id, geom, node_type, degree, ref_id, chamber_cost) " +
-                "    SELECT :taskId, :variantId, d.pt, " +
-                "           COALESCE(old_n.node_type, CASE WHEN d.degree >= 3 THEN 'branch_chamber' ELSE 'technical_node' END), " +
-                "           d.degree, old_n.ref_id, COALESCE(old_n.chamber_cost, 0) " +
-                "    FROM _rp_pts_deg d " +
-                "    LEFT JOIN LATERAL ( " +
-                "        SELECT node_type, ref_id, chamber_cost FROM _rp_old_nodes " +
-                "        WHERE ST_DWithin(geom, d.pt, 0.5) " +
-                "        ORDER BY ST_Distance(geom, d.pt) LIMIT 1 " +
-                "    ) old_n ON true; " +
-                "" +
-                "    -- 8. Вставляем новые сегменты с привязкой к новым узлам" +
-                "    INSERT INTO physical_segment (task_id, variant_id, start_node_id, end_node_id, geom, flow_tph, length_m, laying_method, special_k) " +
-                "    SELECT :taskId, :variantId, ns.id, ne.id, f.geom, f.flow_tph, ST_Length(f.geom), f.laying_method, f.special_k " +
-                "    FROM _rp_attr f " +
-                "    JOIN physical_node ns ON ns.task_id = :taskId AND ns.variant_id = :variantId " +
-                "        AND ST_DWithin(ns.geom, ST_SnapToGrid(ST_StartPoint(f.geom), 0.01), 0.5) " +
-                "    JOIN physical_node ne ON ne.task_id = :taskId AND ne.variant_id = :variantId " +
-                "        AND ST_DWithin(ne.geom, ST_SnapToGrid(ST_EndPoint(f.geom), 0.01), 0.5); " +
-                "END $$;";
+    private int fixCrossings(UUID taskId, String variantId) {
+        int total = 0;
+        for (int iter = 0; iter < 50; iter++) {
+            // Найти ОДНУ пересекающуюся пару (LIMIT 1 для безопасности)
+            List<Map<String, Object>> cross = jdbc.queryForList(
+                    "SELECT a.id AS aid, b.id AS bid, " +
+                            "       ST_X(ST_Intersection(a.geom, b.geom)) AS ix, " +
+                            "       ST_Y(ST_Intersection(a.geom, b.geom)) AS iy " +
+                            "FROM physical_segment a " +
+                            "JOIN physical_segment b ON a.id < b.id " +
+                            "  AND ST_Crosses(a.geom, b.geom) " +
+                            "WHERE a.task_id = ? AND a.variant_id = ? " +
+                            "LIMIT 1",
+                    taskId, variantId);
 
-        MapSqlParameterSource params = new MapSqlParameterSource()
-                .addValue("taskId", taskId)
-                .addValue("variantId", variantId);
+            if (cross.isEmpty()) break;
 
-        namedJdbc.update(sql, params);
-        log.info("[{}][{}] replanarize: network noded with ST_Snap(0.05m) and rebuilt", taskId, variantId);
+            long aid = ((Number) cross.get(0).get("aid")).longValue();
+            long bid = ((Number) cross.get(0).get("bid")).longValue();
+            double ix = ((Number) cross.get(0).get("ix")).doubleValue();
+            double iy = ((Number) cross.get(0).get("iy")).doubleValue();
+
+            // Создать новый technical_node в точке пересечения
+            Long nodeId = jdbc.queryForObject(
+                    "INSERT INTO physical_node (task_id, variant_id, geom, node_type, degree) " +
+                            "VALUES (?, ?, ST_SetSRID(ST_MakePoint(?, ?), 32637), 'technical_node', 4) " +
+                            "RETURNING id",
+                    Long.class, taskId, variantId, ix, iy);
+
+            // Разрезать оба сегмента в точке пересечения
+            splitSegmentAtPoint(taskId, variantId, aid, nodeId, ix, iy);
+            splitSegmentAtPoint(taskId, variantId, bid, nodeId, ix, iy);
+
+            total++;
+            log.debug("[{}][{}] fixCrossings iter {}: split segs {} & {} at ({}, {})",
+                    taskId, variantId, iter, aid, bid, ix, iy);
+        }
+        return total;
+    }
+
+    /**
+     * Разрезает один сегмент в точке (ix, iy), создавая два новых сегмента
+     * с тем же flow/laying/special_k. Оригинальный сегмент удаляется.
+     * <p>
+     * Использует ST_LineLocatePoint для нахождения доли линии и
+     * ST_LineSubstring для разрезания. Это надёжнее, чем ST_Split,
+     * который может вернуть пустой результат при float-погрешностях.
+     */
+    private void splitSegmentAtPoint(UUID taskId, String variantId,
+                                     long segId, long nodeId,
+                                     double ix, double iy) {
+        // Найти долю линии, на которой находится ближайшая точка к (ix, iy)
+        Double frac = jdbc.queryForObject(
+                "SELECT ST_LineLocatePoint(geom, " +
+                        "  ST_SetSRID(ST_MakePoint(?, ?), 32637)) " +
+                        "FROM physical_segment WHERE id = ?",
+                Double.class, ix, iy, segId);
+
+        if (frac == null || frac < 0.001 || frac > 0.999) {
+            // Точка слишком близко к концу — разрез не нужен,
+            // просто перепривязываем конец к новому узлу
+            jdbc.update(
+                    "UPDATE physical_segment SET " +
+                            "  start_node_id = CASE WHEN ST_DWithin(ST_StartPoint(geom), " +
+                            "    ST_SetSRID(ST_MakePoint(?, ?), 32637), 1.0) THEN ? ELSE start_node_id END, " +
+                            "  end_node_id = CASE WHEN ST_DWithin(ST_EndPoint(geom), " +
+                            "    ST_SetSRID(ST_MakePoint(?, ?), 32637), 1.0) THEN ? ELSE end_node_id END " +
+                            "WHERE id = ?",
+                    ix, iy, nodeId, ix, iy, nodeId, segId);
+            return;
+        }
+
+        // Вставить две новые части с наследованием атрибутов
+        jdbc.update(
+                "INSERT INTO physical_segment " +
+                        "  (task_id, variant_id, start_node_id, end_node_id, " +
+                        "   geom, flow_tph, length_m, laying_method, special_k) " +
+                        "SELECT task_id, variant_id, start_node_id, ?, " +
+                        "  ST_LineSubstring(geom, 0, ?), " +
+                        "  flow_tph, ST_Length(ST_LineSubstring(geom, 0, ?)), " +
+                        "  laying_method, special_k " +
+                        "FROM physical_segment WHERE id = ? " +
+                        "UNION ALL " +
+                        "SELECT task_id, variant_id, ?, end_node_id, " +
+                        "  ST_LineSubstring(geom, ?, 1), " +
+                        "  flow_tph, ST_Length(ST_LineSubstring(geom, ?, 1)), " +
+                        "  laying_method, special_k " +
+                        "FROM physical_segment WHERE id = ?",
+                nodeId, frac, frac, segId,
+                nodeId, frac, frac, segId);
+
+        // Удалить оригинальный сегмент
+        jdbc.update("DELETE FROM physical_segment WHERE id = ?", segId);
     }
 
     // ====================================================================
