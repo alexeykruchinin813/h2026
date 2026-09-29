@@ -151,13 +151,20 @@ public class HybridVisibilityGraphService {
     }
 
     /**
-     * Извлекает рёбра для JTS валидации
+     * Извлекает рёбра для JTS валидации.
+     *
+     * <p>V80: добавлены boolean-признаки {@code source_is_oks} / {@code target_is_oks}.
+     * Они нужны U6-правилу, чтобы отличить настоящий OKS-endpoint (разрешён
+     * финальный участок) от escape_point / polygon_corner с тем же
+     * {@code own_polygon_id}.
      */
     private List<EdgeToValidate> extractEdgesForValidation(UUID taskId, int clusterId) {
         String sql = "SELECT ve.id, ve.source_vertex, ve.target_vertex, " +
                 "       ST_AsBinary(ve.geom) AS geom_wkb, " +
                 "       sv.own_polygon_id AS source_oks_id, " +
-                "       tv.own_polygon_id AS target_oks_id " +
+                "       tv.own_polygon_id AS target_oks_id, " +
+                "       (sv.vertex_type = 'oks') AS source_is_oks, " +
+                "       (tv.vertex_type = 'oks') AS target_is_oks " +
                 "FROM visibility_edge ve " +
                 "JOIN visibility_vertex sv ON sv.id = ve.source_vertex " +
                 "JOIN visibility_vertex tv ON tv.id = ve.target_vertex " +
@@ -169,12 +176,14 @@ public class HybridVisibilityGraphService {
                 Geometry geom = new WKBReader(geometryFactory).read(wkb);
 
                 return new EdgeToValidate(
-                    rs.getLong("id"),
-                    rs.getLong("source_vertex"),
-                    rs.getLong("target_vertex"),
-                    geom,
-                    rs.getObject("source_oks_id") != null ? rs.getLong("source_oks_id") : null,
-                    rs.getObject("target_oks_id") != null ? rs.getLong("target_oks_id") : null
+                        rs.getLong("id"),
+                        rs.getLong("source_vertex"),
+                        rs.getLong("target_vertex"),
+                        geom,
+                        rs.getObject("source_oks_id") != null ? rs.getLong("source_oks_id") : null,
+                        rs.getObject("target_oks_id") != null ? rs.getLong("target_oks_id") : null,
+                        rs.getBoolean("source_is_oks"),
+                        rs.getBoolean("target_is_oks")
                 );
             } catch (org.locationtech.jts.io.ParseException e) {
                 throw new RuntimeException("Failed to parse WKB geometry for edge", e);
@@ -257,37 +266,43 @@ public class HybridVisibilityGraphService {
     }
 
     /**
-     * Валидирует рёбра через JTS против индивидуальных полигонов с PreparedGeometry + STRtree
+     * Валидирует рёбра через JTS против индивидуальных полигонов с PreparedGeometry + STRtree.
+     *
+     * <p>V80: U6-правило (разъяснение 3 ТЗ) применяется только если endpoint
+     * ребра — настоящий OKS-vertex. Escape_point и polygon_corner тоже могут
+     * иметь {@code own_polygon_id}, совпадающий с полигоном, но они не являются
+     * точкой подключения — финальный участок к ним правилом не покрывается.
+     *
+     * <p>Порог по длине НЕ применяется: разъяснение 3 не ограничивает длину
+     * финального участка. Расстояние от OKS до ближайшей границы полигона
+     * определяется геометрией здания и может достигать 100+ м (см. OKS 12
+     * на тестовом наборе).
      */
-    private List<Long> validateEdgesWithJTS(List<EdgeToValidate> edges, 
+    private List<Long> validateEdgesWithJTS(List<EdgeToValidate> edges,
                                             Map<Long, RestrictionInfo> polygons,
                                             int newDiameter) {
-        // Определяем точный буфер OKS по диаметру трубы
         double oksBuffer = getOksBufferByDiameter(newDiameter);
 
-        // Строим PreparedGeometry для каждого полигона (с буферизацией)
         Map<Long, PreparedGeometry> preparedGeometries = new HashMap<>();
         Map<Long, Double> bufferDistances = new HashMap<>();
-        
+
         for (Map.Entry<Long, RestrictionInfo> entry : polygons.entrySet()) {
             Long polygonId = entry.getKey();
             RestrictionInfo info = entry.getValue();
-            
+
             double bufferDist = info.getBuffer(oksBuffer);
             Geometry bufferedGeom = BufferOp.bufferOp(info.geom, bufferDist);
             PreparedGeometry preparedGeom = PreparedGeometryFactory.prepare(bufferedGeom);
-            
+
             preparedGeometries.put(polygonId, preparedGeom);
             bufferDistances.put(polygonId, bufferDist);
         }
 
-        // Строим STRtree для быстрого поиска близких полигонов
         STRtree strTree = new STRtree();
         for (Map.Entry<Long, RestrictionInfo> entry : polygons.entrySet()) {
             Long polygonId = entry.getKey();
             RestrictionInfo info = entry.getValue();
-            
-            // Добавляем в tree с расширенным envelope для поиска
+
             Geometry bufferedGeom = BufferOp.bufferOp(info.geom, bufferDistances.get(polygonId));
             strTree.insert(bufferedGeom.getEnvelopeInternal(), polygonId);
         }
@@ -296,42 +311,37 @@ public class HybridVisibilityGraphService {
 
         for (EdgeToValidate edge : edges) {
             boolean isValid = true;
-            Long sourceOksId = edge.sourceOksId;
 
-            // Query tree для кандидатов
             @SuppressWarnings("unchecked")
             List<Long> candidates = strTree.query(edge.geom.getEnvelopeInternal());
-            
+
             for (Long polygonId : candidates) {
                 RestrictionInfo info = polygons.get(polygonId);
 
-                // V40 U6 extended: пропускаем буфер source И target полигона ребра.
-                // Escape/corner_OKS рёбра, чьи концы лежат в своих OKS-полигонах,
-                // не должны отбраковываться собственным буфером (аналог V25-правила U6,
-                // но симметрично для обоих концов).
+                // V80: U6-правило — только для настоящего OKS-endpoint.
+                // Порог по длине НЕ применяется (см. javadoc).
                 if ("oks".equals(info.type)) {
-                    boolean sameAsSource = polygonId.equals(edge.sourceOksId);
-                    boolean sameAsTarget = polygonId.equals(edge.targetOksId);
-                    if (sameAsSource || sameAsTarget) {
+                    boolean sourceIsThisOks = edge.sourceIsOks
+                            && polygonId.equals(edge.sourceOksId);
+                    boolean targetIsThisOks = edge.targetIsOks
+                            && polygonId.equals(edge.targetOksId);
+
+                    if (sourceIsThisOks || targetIsThisOks) {
                         continue;
                     }
                 }
 
                 PreparedGeometry preparedGeom = preparedGeometries.get(polygonId);
-                
-                // Проверяем пересечение
+
                 if (preparedGeom.intersects(edge.geom)) {
-                    // Для road/tram_tracks проверяем угол пересечения
                     if ("road".equals(info.type) || "tram_tracks".equals(info.type)) {
                         if (!validateCrossingAngle(edge.geom, info.geom, 45.0)) {
                             isValid = false;
                             break;
                         }
-                        // Если угол >= 45°, продолжаем проверку других полигонов
                         continue;
                     }
-                    
-                    // Для остальных forbidden — сразу invalid
+
                     isValid = false;
                     break;
                 }
@@ -480,7 +490,7 @@ public class HybridVisibilityGraphService {
      *   ≥ 900 мм → 9,0 м
      */
     private double getOksBufferByDiameter(int diameterMm) {
-        if (diameterMm < 500)  return 5.0;
+        if (diameterMm < 500)  return this.oksBufferExact;
         if (diameterMm <= 800) return 7.0;
         return 9.0;
     }
@@ -512,6 +522,13 @@ public class HybridVisibilityGraphService {
 
     // ===== Вспомогательный класс =====
 
+    // ===== Вспомогательный класс =====
+
+    /**
+     * V80: добавлены {@link #sourceIsOks} / {@link #targetIsOks}, чтобы
+     * U6-правило отличало настоящий OKS-endpoint от escape_point /
+     * polygon_corner с тем же {@code own_polygon_id}.
+     */
     static class EdgeToValidate {
         final long id;
         final long sourceVertex;
@@ -519,14 +536,20 @@ public class HybridVisibilityGraphService {
         final Geometry geom;
         final Long sourceOksId;
         final Long targetOksId;
+        final boolean sourceIsOks;
+        final boolean targetIsOks;
 
         EdgeToValidate(long id, long sourceVertex, long targetVertex,
-                       Geometry geom, Long sourceOksId, Long targetOksId) {
+                       Geometry geom, Long sourceOksId, Long targetOksId,
+                       boolean sourceIsOks, boolean targetIsOks) {
             this.id = id;
             this.sourceVertex = sourceVertex;
             this.targetVertex = targetVertex;
             this.geom = geom;
             this.sourceOksId = sourceOksId;
             this.targetOksId = targetOksId;
+            this.sourceIsOks = sourceIsOks;
+            this.targetIsOks = targetIsOks;
         }
-    }}
+    }
+}

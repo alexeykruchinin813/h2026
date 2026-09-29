@@ -220,11 +220,11 @@ public class SteinerTreeBuilder {
                 }
             }
             if (total > 0) {
-                log.warn("sharpTurnPenalty: {} со штрафом {}", pathWkt.length(), total);
+                log.debug("sharpTurnPenalty: {} со штрафом {}", pathWkt.length(), total);
             }
             return total;
         } catch (Exception e) {
-            log.warn("sharpTurnPenalty failed to parse WKT: {}", e.getMessage());
+            log.debug("sharpTurnPenalty failed to parse WKT: {}", e.getMessage());
             return 0.0;
         }
     }

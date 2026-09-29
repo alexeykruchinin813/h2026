@@ -491,4 +491,60 @@ public class TieInCoordinationService {
         }
         return null;
     }
+
+    // ==========================================================================
+    // V79: pickSharedTarget без учёта capacity
+    // ==========================================================================
+
+    /**
+     * V79: выбор shared target без учёта capacity.
+     *
+     * <p>Используется для v2/v3, когда нужно посадить как можно больше OKS
+     * на одну врезку. Capacity существующей камеры (=4) игнорируется:
+     * по разъяснению 11 ТЗ, если существующая камера не выдерживает
+     * примыканий, в её точке создаётся НОВАЯ камера. Физический слой
+     * (cascadeSplitOverloadedNodes + split_oversized_chambers) разрежет
+     * перегруженный узел.
+     *
+     * <p>Возвращает target_vertex_id с максимальным покрытием OKS;
+     * при равенстве покрытия — с минимальной суммой стоимости путей.
+     * Возвращает null, если ни одна OKS не имеет путей.
+     */
+    public Long pickSharedTargetIgnoringCapacity(
+            Set<Long> oksGroup,
+            Map<Long, List<PathResult>> allPaths) {
+
+        Map<Long, Integer> coverage = new HashMap<>();
+        Map<Long, Double> sumCost = new HashMap<>();
+
+        for (Long oks : oksGroup) {
+            List<PathResult> paths = allPaths.get(oks);
+            if (paths == null) continue;
+            for (PathResult p : paths) {
+                long t = p.getToVertex();
+                coverage.merge(t, 1, Integer::sum);
+                sumCost.merge(t, p.getTotalCost(), Double::sum);
+            }
+        }
+
+        if (coverage.isEmpty()) return null;
+
+        Long best = null;
+        int bestCover = -1;
+        double bestSum = Double.MAX_VALUE;
+        for (Map.Entry<Long, Integer> e : coverage.entrySet()) {
+            long t = e.getKey();
+            int cov = e.getValue();
+            double sum = sumCost.getOrDefault(t, Double.MAX_VALUE);
+            if (cov > bestCover || (cov == bestCover && sum < bestSum)) {
+                best = t;
+                bestCover = cov;
+                bestSum = sum;
+            }
+        }
+
+        log.info("pickSharedTargetIgnoringCapacity: target={} covers {}/{} OKS (sumCost={})",
+                best, bestCover, oksGroup.size(), String.format("%.1f", bestSum));
+        return best;
+    }
 }

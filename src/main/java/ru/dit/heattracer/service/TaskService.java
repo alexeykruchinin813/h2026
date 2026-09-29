@@ -314,29 +314,42 @@ public class TaskService {
             TieInCoordinationService.CapacityState capV3 = baseCap.copy();
 
             // Второй проход: назначаем с общей capacity-картой на вариант.
-// Второй проход: назначаем с общей capacity-картой на вариант.
             for (ClusterPaths cp : clusterPathsList) {
                 int clusterId = cp.cluster.getClusterId();
 
-                // v1: индивидуальное назначение через SSP
+                // ===== v1: индивидуальное назначение через SSP (capacity-aware) =====
                 TieInCoordinationService.SspResult sspV1 =
                         tieInCoordinationService.assignIndividual(cp.allPaths, capV1);
                 Map<Long, PathResult> v1 = rebuildSharedPaths(
                         id, clusterId, cp.oksVertexIds, sspV1, capV1);
 
-                // v2: shared target для всего кластера
-                Long sharedAll = tieInCoordinationService.pickSharedTarget(
-                        new HashSet<>(cp.oksVertexIds), cp.allPaths, capV2);
-                Set<Long> preferredV2 = sharedAll == null
-                        ? Collections.emptySet()
-                        : Collections.singleton(sharedAll);
-                TieInCoordinationService.SspResult sspV2 =
-                        tieInCoordinationService.assignShared(
-                                new HashSet<>(cp.oksVertexIds), cp.allPaths, capV2, preferredV2);
-                Map<Long, PathResult> v2 = rebuildSharedPaths(
-                        id, clusterId, cp.oksVertexIds, sspV2, capV2);
+                // ===== v2: один shared target без capacity (V79) =====
+                Map<Long, PathResult> v2;
+                Long sharedAll = tieInCoordinationService.pickSharedTargetIgnoringCapacity(
+                        new HashSet<>(cp.oksVertexIds), cp.allPaths);
+                if (sharedAll != null) {
+                    Map<Long, PathResult> tree = steinerTreeBuilder.buildSharedTree(
+                            id, clusterId, sharedAll, cp.oksVertexIds);
+                    v2 = new LinkedHashMap<>(tree);
 
-                // v3: два shared target (sub-split по X)
+                    int fallbackCnt = 0;
+                    for (Long oks : cp.oksVertexIds) {
+                        if (v2.containsKey(oks)) continue;
+                        PathResult p = pathFinderService.findBestPathFromOks(id, clusterId, oks);
+                        if (p != null) {
+                            v2.put(oks, p);
+                            fallbackCnt++;
+                        }
+                    }
+                    log.info("[{}] Cluster {} v2: tree covers {}/{}, {} via fallback",
+                            id, clusterId, tree.size(), cp.oksVertexIds.size(), fallbackCnt);
+                } else {
+                    log.warn("[{}] Cluster {} v2: no shared target — falling back to v1",
+                            id, clusterId);
+                    v2 = new LinkedHashMap<>(v1);
+                }
+
+                // ===== v3: два shared target без capacity (V79) =====
                 Map<Long, PathResult> v3;
                 if (cp.oksVertexIds.size() >= 4) {
                     Map<Long, Double> oksX = new HashMap<>();
@@ -352,17 +365,35 @@ public class TaskService {
                     Set<Long> groupA = new HashSet<>(sorted.subList(0, mid));
                     Set<Long> groupB = new HashSet<>(sorted.subList(mid, sorted.size()));
 
-                    Long sharedA = tieInCoordinationService.pickSharedTarget(groupA, cp.allPaths, capV3);
-                    Long sharedB = tieInCoordinationService.pickSharedTarget(groupB, cp.allPaths, capV3);
-                    Set<Long> preferredV3 = new HashSet<>();
-                    if (sharedA != null) preferredV3.add(sharedA);
-                    if (sharedB != null && !sharedB.equals(sharedA)) preferredV3.add(sharedB);
+                    Long tA = tieInCoordinationService.pickSharedTargetIgnoringCapacity(
+                            groupA, cp.allPaths);
+                    Long tB = tieInCoordinationService.pickSharedTargetIgnoringCapacity(
+                            groupB, cp.allPaths);
 
-                    TieInCoordinationService.SspResult sspV3 =
-                            tieInCoordinationService.assignSubSplit(
-                                    cp.oksVertexIds, cp.allPaths, capV3, oksX, preferredV3);
-                    v3 = rebuildSharedPaths(
-                            id, clusterId, cp.oksVertexIds, sspV3, capV3);
+                    Map<Long, PathResult> treeA = tA == null
+                            ? Collections.<Long, PathResult>emptyMap()
+                            : steinerTreeBuilder.buildSharedTree(id, clusterId, tA,
+                            new ArrayList<>(groupA));
+                    Map<Long, PathResult> treeB = (tB == null || tB.equals(tA))
+                            ? Collections.<Long, PathResult>emptyMap()
+                            : steinerTreeBuilder.buildSharedTree(id, clusterId, tB,
+                            new ArrayList<>(groupB));
+
+                    v3 = new LinkedHashMap<>();
+                    v3.putAll(treeA);
+                    v3.putAll(treeB);
+
+                    int fallbackCnt = 0;
+                    for (Long oks : cp.oksVertexIds) {
+                        if (v3.containsKey(oks)) continue;
+                        PathResult p = pathFinderService.findBestPathFromOks(id, clusterId, oks);
+                        if (p != null) {
+                            v3.put(oks, p);
+                            fallbackCnt++;
+                        }
+                    }
+                    log.info("[{}] Cluster {} v3: 2-tree covers {}/{}, {} via fallback",
+                            id, clusterId, v3.size() - fallbackCnt, cp.oksVertexIds.size(), fallbackCnt);
                 } else {
                     v3 = new LinkedHashMap<>(v1);
                 }
