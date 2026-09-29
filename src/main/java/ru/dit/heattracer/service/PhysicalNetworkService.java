@@ -53,6 +53,18 @@ public class PhysicalNetworkService {
                 taskId, variantId);
         if (r.segments == 0) return r;
 
+        // 1.5 V77: разрыв циклов (артефакт ST_Node planarization).
+        // Удаляем по одному ребру на цикл, предпочитая рёбра, удаление
+        // которых понижает degree branch_chamber (экономия на камере).
+        Integer pruned = jdbc.queryForObject(
+                "SELECT prune_physical_cycles(?, ?)",
+                Integer.class, taskId, variantId);
+        if (pruned != null && pruned > 0) {
+            log.info("[{}][{}] prune_physical_cycles: {} edges removed",
+                    taskId, variantId, pruned);
+            r = recount(taskId, variantId);
+        }
+
         // 2. Каскадный сплит перегруженных узлов (degree > 4)
         int cascaded = cascadeSplitOverloadedNodes(taskId, variantId);
         if (cascaded > 0) {
