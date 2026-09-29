@@ -71,6 +71,7 @@ public class TaskService {
     private final DiameterPicker diameterPicker;
     private final RouteBuilderService routeBuilderService;
     private final TieInCoordinationService tieInCoordinationService;
+    private final SteinerTreeBuilder steinerTreeBuilder;
 
     public TaskService(
             @Qualifier("calcExecutor") Executor calcExecutor,
@@ -89,7 +90,8 @@ public class TaskService {
             PathFinderService pathFinderService,
             DiameterPicker diameterPicker,
             RouteBuilderService routeBuilderService,
-            TieInCoordinationService tieInCoordinationService
+            TieInCoordinationService tieInCoordinationService,
+            SteinerTreeBuilder steinerTreeBuilder
     ) throws IOException {
         this.calcExecutor = calcExecutor;
         this.storageRoot = Paths.get(storageDir);
@@ -108,6 +110,7 @@ public class TaskService {
         this.diameterPicker = diameterPicker;
         this.routeBuilderService = routeBuilderService;
         this.tieInCoordinationService = tieInCoordinationService;
+        this.steinerTreeBuilder = steinerTreeBuilder;
         Files.createDirectories(storageRoot);
         log.info("Storage root: {}", storageRoot.toAbsolutePath());
     }
@@ -205,6 +208,11 @@ public class TaskService {
             state.setPercent(80);
 
             List<OksCluster> clusters = clusterService.cluster(id);
+            // V77: сортируем по убыванию размера — крупные кластеры первыми.
+            // Capacity-карта общая на все кластеры, а SSP назначает в порядке обработки.
+            // Крупный кластер должен получить приоритет, иначе мелкие съедят
+            // capacity групп, нужных ему.
+            clusters.sort(Comparator.comparing(OksCluster::size).reversed());
             log.info("[{}] OKS clusters: {}", id, clusters.size());
 
             state.setPercent(83);
@@ -312,45 +320,23 @@ public class TaskService {
                 // v1: индивидуальное назначение через SSP
                 TieInCoordinationService.SspResult sspV1 =
                         tieInCoordinationService.assignIndividual(cp.allPaths, capV1);
-                Map<Long, PathResult> v1 = rebuildSharedPaths(id, clusterId, sspV1, capV1);
+                Map<Long, PathResult> v1 = rebuildSharedPaths(
+                        id, clusterId, cp.oksVertexIds, sspV1, capV1);
 
                 // v2: shared target для всего кластера
-                Long sharedAll = tieInCoordinationService.pickSharedTarget(
-                        new HashSet<>(cp.oksVertexIds), cp.allPaths, capV2);
-                Set<Long> preferredV2 = sharedAll == null
-                        ? Collections.emptySet()
-                        : Collections.singleton(sharedAll);
                 TieInCoordinationService.SspResult sspV2 =
                         tieInCoordinationService.assignShared(
                                 new HashSet<>(cp.oksVertexIds), cp.allPaths, capV2, preferredV2);
-                Map<Long, PathResult> v2 = rebuildSharedPaths(id, clusterId, sspV2, capV2);
+                Map<Long, PathResult> v2 = rebuildSharedPaths(
+                        id, clusterId, cp.oksVertexIds, sspV2, capV2);
 
                 // v3: два shared target (sub-split по X)
                 Map<Long, PathResult> v3;
                 if (cp.oksVertexIds.size() >= 4) {
-                    Map<Long, Double> oksX = new HashMap<>();
-                    jdbcTemplate.query(
-                            "SELECT id, ST_X(geom) AS x FROM visibility_vertex " +
-                                    "WHERE task_id = ? AND cluster_id = ? AND vertex_type = 'oks'",
-                            rs -> { oksX.put(rs.getLong("id"), rs.getDouble("x")); },
-                            id, clusterId);
-
-                    List<Long> sorted = new ArrayList<>(cp.oksVertexIds);
-                    sorted.sort(Comparator.comparingDouble(oksX::get));
-                    int mid = sorted.size() / 2;
-                    Set<Long> groupA = new HashSet<>(sorted.subList(0, mid));
-                    Set<Long> groupB = new HashSet<>(sorted.subList(mid, sorted.size()));
-
-                    Long sharedA = tieInCoordinationService.pickSharedTarget(groupA, cp.allPaths, capV3);
-                    Long sharedB = tieInCoordinationService.pickSharedTarget(groupB, cp.allPaths, capV3);
-                    Set<Long> preferredV3 = new HashSet<>();
-                    if (sharedA != null) preferredV3.add(sharedA);
-                    if (sharedB != null && !sharedB.equals(sharedA)) preferredV3.add(sharedB);
-
                     TieInCoordinationService.SspResult sspV3 =
                             tieInCoordinationService.assignSubSplit(
                                     cp.oksVertexIds, cp.allPaths, capV3, oksX, preferredV3);
-                    v3 = rebuildSharedPaths(id, clusterId, sspV3, capV3);
+                    v3 = rebuildSharedPaths(id, clusterId, cp.oksVertexIds, sspV3, capV3);
                 } else {
                     v3 = new LinkedHashMap<>(v1);
                 }
@@ -492,54 +478,90 @@ public class TaskService {
     }
 
     /**
-     * V72: перестраивает пути по target-группам через multi-target Dijkstra.
+     * V76: SPH (Greedy Steiner) вместо multi-target Dijkstra от virtual_root.
      *
-     * <p>SSP выбрал, какой OKS к какой target-группе идёт. Для каждой группы
-     * запускается {@link PathFinderService#findSharedPathsFromGroup} — один
-     * pgr_dijkstra от виртуального корня группы до всех OKS. Результат — дерево
-     * кратчайших путей: общие рёбра шарятся между OKS автоматически.
+     * <p>Для каждой target-группы SSP запускается {@link SteinerTreeBuilder}:
+     * инкрементально строится дерево, шарящее общие стволы. Общие рёбра
+     * появляются по построению (не как случайное совпадение N независимых A*).
      *
-     * <p>Для OKS, для которых shared path отброшен из-за транзита через чужой
-     * OKS (V55), PathFinderService делает fallback на одиночный A*.
+     * <p>Fallback: OKS, для которых дерево не нашло путь (V55 транзит,
+     * изолированность) — берётся прямой путь из {@code ssp.assigned}.
+     */
+    /**
+     * V77: перестраивает пути для кластера.
+     *
+     * <p>Три уровня:
+     * <ol>
+     *   <li>SPH-деревья по target-группам SSP (OKS, назначенные SSP).</li>
+     *   <li>SSP-assigned, не попавшие в дерево — берём SSP-путь.</li>
+     *   <li>OKS, дропнутые SSP из-за capacity — fallback через
+     *       {@link PathFinderService#findBestPathFromOks}. Гарантирует 17/17,
+     *       пока у OKS есть хотя бы один путь в графе видимости.</li>
+     * </ol>
+     *
+     * <p>V77-fix: representative для дерева — target-вершина, к которой SSP
+     * направил больше всего OKS из группы (не обязательно {@code groupId},
+     * который может быть не связан в графе видимости).
      */
     private Map<Long, PathResult> rebuildSharedPaths(
             UUID taskId, int clusterId,
+            List<Long> allOksVertices,
             TieInCoordinationService.SspResult ssp,
             TieInCoordinationService.CapacityState state) {
 
-        if (ssp == null || ssp.isEmpty()) return new LinkedHashMap<>();
-
         Map<Long, PathResult> result = new LinkedHashMap<>();
 
-        for (Map.Entry<Long, List<Long>> entry : ssp.byTargetGroup.entrySet()) {
-            long groupId = entry.getKey();
-            List<Long> oksList = entry.getValue();
-            if (oksList == null || oksList.isEmpty()) continue;
+        // ===== 1. SPH-деревья по target-группам =====
+        if (ssp != null && !ssp.isEmpty()) {
+            for (Map.Entry<Long, List<Long>> entry : ssp.byTargetGroup.entrySet()) {
+                long groupId = entry.getKey();
+                List<Long> oksList = entry.getValue();
+                if (oksList == null || oksList.isEmpty()) continue;
 
-            List<Long> targetVertices = state.targetsOfGroup(groupId);
-
-            if (targetVertices.isEmpty()) {
+                // V77: фактический representative — target-вершина, которую
+                // SSP реально использовал (группа может содержать несколько
+                // вершин с одинаковой геометрией, но разной связностью в графе).
+                Map<Long, Integer> targetUsage = new HashMap<>();
                 for (Long oks : oksList) {
                     PathResult p = ssp.assigned.get(oks);
-                    if (p != null) result.put(oks, p);
+                    if (p != null) targetUsage.merge(p.getToVertex(), 1, Integer::sum);
                 }
-                continue;
+                long representative = targetUsage.entrySet().stream()
+                        .max(Map.Entry.comparingByValue())
+                        .map(Map.Entry::getKey)
+                        .orElse(groupId);
+
+                Map<Long, PathResult> tree = steinerTreeBuilder.buildSharedTree(
+                        taskId, clusterId, representative, oksList);
+                result.putAll(tree);
             }
 
-            List<PathResult> shared = pathFinderService.findSharedPathsFromGroup(
-                    taskId, clusterId, targetVertices, oksList);
-
-            Set<Long> covered = new HashSet<>();
-            for (PathResult p : shared) {
-                result.put(p.getFromVertex(), p);
-                covered.add(p.getFromVertex());
-            }
-
-            for (Long oks : oksList) {
-                if (!covered.contains(oks)) {
-                    PathResult p = ssp.assigned.get(oks);
-                    if (p != null) result.put(oks, p);
+            // ===== 2. SSP-assigned, не покрытые деревом =====
+            for (Map.Entry<Long, PathResult> e : ssp.assigned.entrySet()) {
+                if (!result.containsKey(e.getKey())) {
+                    result.put(e.getKey(), e.getValue());
                 }
+            }
+        }
+
+        // ===== 3. Fallback для OKS, дропнутых SSP =====
+        // (capacity exhausted — не покрываются byTargetGroup и assigned)
+        if (allOksVertices != null) {
+            int fallbackCount = 0;
+            for (Long oks : allOksVertices) {
+                if (result.containsKey(oks)) continue;
+                PathResult fb = pathFinderService.findBestPathFromOks(taskId, clusterId, oks);
+                if (fb != null) {
+                    result.put(oks, fb);
+                    fallbackCount++;
+                } else {
+                    log.warn("[{}] Cluster {}: no fallback path for SSP-dropped OKS {}",
+                            taskId, clusterId, oks);
+                }
+            }
+            if (fallbackCount > 0) {
+                log.info("[{}] Cluster {}: {} SSP-dropped OKS recovered via fallback",
+                        taskId, clusterId, fallbackCount);
             }
         }
 

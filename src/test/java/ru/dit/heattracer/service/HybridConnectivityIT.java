@@ -516,19 +516,18 @@ class HybridConnectivityIT extends BasePostgresIntegrationTest {
 
             // 11.  cross-candidate
             try {
-                List<Map<String,Object>> candidatesByRef = jdbcTemplate.queryForList(
-                        "SELECT vv.ref_id, COUNT(*) AS candidate_count " +
-                                "FROM visibility_vertex vv " +
-                                "JOIN input_feature f ON f.task_id = vv.task_id " +
-                                "  AND f.feature_id::text = vv.ref_id AND f.object_type = 'heat_chamber' " +
-                                "WHERE vv.task_id = ? AND vv.vertex_type = 'candidate' " +
-                                "GROUP BY vv.ref_id HAVING COUNT(*) > 1",
-                        currentTaskId);
-                sb.append("[candidates_by_ref] multi_candidate_chambers=")
-                        .append(candidatesByRef.size()).append("\n");
-                candidatesByRef.forEach(r -> sb.append("    ref=")
-                        .append(r.get("ref_id")).append(" candidates=")
-                        .append(r.get("candidate_count")).append("\n"));
+                List<Map<String,Object>> aggRows = jdbcTemplate.queryForList(
+                        "SELECT a.variant_id AS vid, count(*) AS cnt " +
+                                "FROM physical_segment a " +
+                                "JOIN physical_segment b ON a.task_id = b.task_id " +
+                                "  AND a.variant_id = b.variant_id AND a.id < b.id " +
+                                "WHERE a.task_id = ? " +
+                                "  AND ST_Intersects(a.geom, b.geom) AND NOT ST_Touches(a.geom, b.geom) " +
+                                "GROUP BY a.variant_id", currentTaskId);
+                for (Map<String,Object> r : aggRows) {
+                    sb.append("[metric] aggregated_segments ").append(r.get("vid"))
+                            .append(" = ").append(r.get("cnt")).append("\n");
+                }
             } catch (Exception e) {
                 sb.append("[candidates_by_ref_error] ").append(e.getMessage()).append("\n");
             }

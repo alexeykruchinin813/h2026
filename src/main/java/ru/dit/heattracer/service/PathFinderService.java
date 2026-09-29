@@ -80,7 +80,7 @@ public class PathFinderService {
                         }
                         results.add(new PathResult(
                                 oks, target,
-                                toDouble(rs.getBigDecimal("total_cost")),
+                                rs.getDouble("total_cost"),
                                 toDouble(rs.getBigDecimal("total_length")),
                                 rs.getInt("edge_count"),
                                 wkt, ids, true));
@@ -189,7 +189,7 @@ public class PathFinderService {
                     }
                     results.add(new PathResult(
                             oksVertex, target,
-                            toDouble(rs.getBigDecimal("total_cost")),
+                            rs.getDouble("total_cost"),
                             toDouble(rs.getBigDecimal("total_length")),
                             rs.getInt("edge_count"),
                             wkt, ids, true));
@@ -229,7 +229,7 @@ public class PathFinderService {
 
                         return new PathResult(
                                 oksVertex, target,
-                                toDouble(rs.getBigDecimal("total_cost")),
+                                rs.getDouble("total_cost"),
                                 toDouble(rs.getBigDecimal("total_length")),
                                 rs.getInt("edge_count"),
                                 wkt, ids, true);
@@ -240,6 +240,151 @@ public class PathFinderService {
                     taskId, oksVertex, e.getMessage());
             return null;
         }
+    }
+
+    // ========================================================================
+    // V76: SPH (Greedy Steiner) — примитивы
+    // ========================================================================
+
+    /**
+     * Multi-source Dijkstra: для каждой OKS из {@code targetVertices} —
+     * ближайшая вершина из {@code sourceVertices} и путь к ней.
+     *
+     * <p>Используется в SPH на каждой итерации: source = растущее множество
+     * treeNodes, target = непокрытые OKS.
+     */
+    public List<PathResult> findPathsToSet(UUID taskId, int clusterId,
+                                           List<Long> sourceVertices,
+                                           List<Long> targetVertices) {
+        if (sourceVertices == null || sourceVertices.isEmpty()) return Collections.emptyList();
+        if (targetVertices == null || targetVertices.isEmpty()) return Collections.emptyList();
+
+        Long[] srcArr = sourceVertices.toArray(new Long[0]);
+        Long[] tgtArr = targetVertices.toArray(new Long[0]);
+
+        long start = System.currentTimeMillis();
+        List<PathResult> results = new ArrayList<>();
+
+        jdbc.query(
+                con -> {
+                    java.sql.PreparedStatement ps = con.prepareStatement(
+                            "SELECT oks_vertex_id, target_source_id, total_cost, total_length, " +
+                                    "       edge_count, ST_AsText(path_geom) AS path_wkt, edge_ids " +
+                                    "  FROM find_paths_to_set(?, ?, ?, ?)");
+                    ps.setObject(1, taskId);
+                    ps.setInt(2, clusterId);
+                    ps.setArray(3, con.createArrayOf("bigint", srcArr));
+                    ps.setArray(4, con.createArrayOf("bigint", tgtArr));
+                    return ps;
+                },
+                rs -> {
+                    try {
+                        long oks = rs.getLong("oks_vertex_id");
+                        long src = rs.getLong("target_source_id");
+                        String wkt = rs.getString("path_wkt");
+                        List<Long> ids = extractLongArray(rs.getArray("edge_ids"));
+                        results.add(new PathResult(
+                                oks, src,
+                                rs.getDouble("total_cost"),
+                                toDouble(rs.getBigDecimal("total_length")),
+                                rs.getInt("edge_count"),
+                                wkt, ids, true));
+                    } catch (java.sql.SQLException ex) {
+                        throw new RuntimeException(ex);
+                    }
+                });
+
+        long elapsed = System.currentTimeMillis() - start;
+        log.debug("[{}] Cluster {}: findPathsToSet |S|={} |T|={} → {} paths ({} ms)",
+                taskId, clusterId, sourceVertices.size(), targetVertices.size(),
+                results.size(), elapsed);
+        return results;
+    }
+
+    /**
+     * Путь от корня дерева до каждой OKS — только по подмножеству рёбер дерева.
+     * Дерево ациклическое → путь единственный.
+     */
+    public List<PathResult> findPathsThroughTree(UUID taskId, int clusterId,
+                                                 long root,
+                                                 List<Long> oksVertices,
+                                                 Collection<Long> treeEdges) {
+        if (oksVertices == null || oksVertices.isEmpty()) return Collections.emptyList();
+        if (treeEdges == null || treeEdges.isEmpty()) return Collections.emptyList();
+
+        Long[] oksArr = oksVertices.toArray(new Long[0]);
+        Long[] edgeArr = treeEdges.toArray(new Long[0]);
+
+        List<PathResult> results = new ArrayList<>();
+        jdbc.query(
+                con -> {
+                    java.sql.PreparedStatement ps = con.prepareStatement(
+                            "SELECT oks_vertex_id, total_cost, total_length, " +
+                                    "       edge_count, ST_AsText(path_geom) AS path_wkt, edge_ids " +
+                                    "  FROM find_paths_through_tree(?, ?, ?, ?, ?)");
+                    ps.setObject(1, taskId);
+                    ps.setInt(2, clusterId);
+                    ps.setLong(3, root);
+                    ps.setArray(4, con.createArrayOf("bigint", oksArr));
+                    ps.setArray(5, con.createArrayOf("bigint", edgeArr));
+                    return ps;
+                },
+                rs -> {
+                    try {
+                        long oks = rs.getLong("oks_vertex_id");
+                        String wkt = rs.getString("path_wkt");
+                        List<Long> ids = extractLongArray(rs.getArray("edge_ids"));
+                        // fromVertex = OKS, toVertex = root — как в findPathsFromOks
+                        results.add(new PathResult(
+                                oks, root,
+                                rs.getDouble("total_cost"),
+                                toDouble(rs.getBigDecimal("total_length")),
+                                rs.getInt("edge_count"),
+                                wkt, ids, true));
+                    } catch (java.sql.SQLException ex) {
+                        throw new RuntimeException(ex);
+                    }
+                });
+        return results;
+    }
+
+    /**
+     * Все вершины, инцидентные рёбрам {@code edgeIds}.
+     * Используется SPH для роста множества treeNodes.
+     */
+    public Set<Long> verticesOfEdges(UUID taskId, int clusterId, Collection<Long> edgeIds) {
+        if (edgeIds == null || edgeIds.isEmpty()) return Collections.emptySet();
+        Long[] arr = edgeIds.toArray(new Long[0]);
+        Set<Long> result = new HashSet<>();
+        jdbc.query(
+                con -> {
+                    java.sql.PreparedStatement ps = con.prepareStatement(
+                            "SELECT source_vertex, target_vertex " +
+                                    "  FROM visibility_edge " +
+                                    " WHERE task_id = ? AND cluster_id = ? AND id = ANY(?)");
+                    ps.setObject(1, taskId);
+                    ps.setInt(2, clusterId);
+                    ps.setArray(3, con.createArrayOf("bigint", arr));
+                    return ps;
+                },
+                rs -> {
+                    result.add(rs.getLong("source_vertex"));
+                    result.add(rs.getLong("target_vertex"));
+                });
+        return result;
+    }
+
+    private static List<Long> extractLongArray(java.sql.Array arr) throws java.sql.SQLException {
+        List<Long> ids = new ArrayList<>();
+        if (arr != null) {
+            Object raw = arr.getArray();
+            if (raw instanceof Long[]) {
+                for (Long id : (Long[]) raw) ids.add(id);
+            } else if (raw instanceof Object[]) {
+                for (Object id : (Object[]) raw) ids.add(((Number) id).longValue());
+            }
+        }
+        return ids;
     }
 
     /**
