@@ -30,7 +30,7 @@ public class PathFinderService {
      * (устраняет радиальную топологию 17 независимых A*).
      *
      * <p>V55: SQL-функция исключает пути, проходящие через чужой OKS.
-     * Для отброшенных OKS Java-слой вызывает {@link #findSinglePath} для fallback.
+     * Для отброшенных OKS Java-слой вызывает {@link #findBestPathFromOks} для fallback.
      *
      * @param targetVertices все target-вершины группы (edge projections одной камеры)
      * @param oksVertices    все OKS, назначенные SSP на эту группу
