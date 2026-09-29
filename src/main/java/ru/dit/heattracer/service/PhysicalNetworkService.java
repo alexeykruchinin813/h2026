@@ -53,6 +53,35 @@ public class PhysicalNetworkService {
                 taskId, variantId);
         if (r.segments == 0) return r;
 
+        // 1.5 V77: разрыв циклов (артефакт ST_Node planarization).
+        // Удаляем по одному ребру на цикл, предпочитая рёбра, удаление
+        // которых понижает degree branch_chamber (экономия на камере).
+        Integer pruned = jdbc.queryForObject(
+                "SELECT prune_physical_cycles(?, ?)",
+                Integer.class, taskId, variantId);
+        if (pruned != null && pruned > 0) {
+            log.info("[{}][{}] prune_physical_cycles: {} edges removed",
+                    taskId, variantId, pruned);
+            r = recount(taskId, variantId);
+        }
+
+        // V78: чистка висячих стубов.
+        // Выполняется для ВСЕХ вариантов, не только тех, где был prune.
+        List<Map<String, Object>> cleanup = jdbc.queryForList(
+                "SELECT * FROM cleanup_terminal_stubs(?, ?)", taskId, variantId);
+        if (!cleanup.isEmpty()) {
+            Map<String, Object> row = cleanup.get(0);
+            int rec = ((Number) row.get("reclassified")).intValue();
+            int delSeg = ((Number) row.get("deleted_segs")).intValue();
+            int delNode = ((Number) row.get("deleted_nodes")).intValue();
+            if (rec > 0 || delSeg > 0 || delNode > 0) {
+                log.info("[{}][{}] cleanup_terminal_stubs: {} reclassified, " +
+                                "{} segments deleted, {} nodes deleted",
+                        taskId, variantId, rec, delSeg, delNode);
+                r = recount(taskId, variantId);
+            }
+        }
+
         // 2. Каскадный сплит перегруженных узлов (degree > 4)
         int cascaded = cascadeSplitOverloadedNodes(taskId, variantId);
         if (cascaded > 0) {
@@ -90,6 +119,9 @@ public class PhysicalNetworkService {
             log.info("[{}][{}] dedup: removed {} parallel duplicate segments",
                     taskId, variantId, deduped);
         }
+
+        // 5.0 SnapSegmentEndpoints
+        snapSegmentEndpoints(taskId, variantId);
 
         // 5. Точечное исправление пересечений (ST_Point и ST_LineString)
         int fixed = fixCrossings(taskId, variantId);
@@ -153,6 +185,11 @@ public class PhysicalNetworkService {
      * Не переназначает diameter — только cost = length_m * special_k * price.
      */
     private void recalcCosts(UUID taskId, String variantId) {
+        jdbc.update(
+                "UPDATE physical_segment SET length_m = ST_Length(geom) " +
+                        "WHERE task_id = ? AND variant_id = ?",
+                taskId, variantId);
+
         int updated = jdbc.update(
                 "UPDATE physical_segment s SET cost = s.length_m * COALESCE(s.special_k, 1.0) * " +
                         "  CASE WHEN s.diameter <= 100 THEN 3780.0  WHEN s.diameter <= 125 THEN 4050.0 " +
@@ -338,8 +375,38 @@ public class PhysicalNetworkService {
         }
     }
 
+    // 5.0 Snap segment endpoints to their node geometry (V77).
+    // Устраняет микрозазоры между physical_segment.geom (LINESTRING endpoint)
+    // и physical_node.geom. Без этого ST_Touches для пар сегментов, делящих
+    // узел, возвращает false, и fixCrossings уходит в 200-итерационный цикл.
+    private int snapSegmentEndpoints(UUID taskId, String variantId) {
+        int n = jdbc.update(
+                "UPDATE physical_segment s SET geom = " +
+                        "  ST_SetPoint(s.geom, 0, n.geom) " +
+                        "FROM physical_node n " +
+                        "WHERE s.task_id = ? AND s.variant_id = ? " +
+                        "  AND n.task_id = s.task_id AND n.variant_id = s.variant_id " +
+                        "  AND s.start_node_id = n.id " +
+                        "  AND NOT ST_Equals(ST_StartPoint(s.geom), n.geom)",
+                taskId, variantId);
+        n += jdbc.update(
+                "UPDATE physical_segment s SET geom = " +
+                        "  ST_SetPoint(s.geom, ST_NumPoints(s.geom) - 1, n.geom) " +
+                        "FROM physical_node n " +
+                        "WHERE s.task_id = ? AND s.variant_id = ? " +
+                        "  AND n.task_id = s.task_id AND n.variant_id = s.variant_id " +
+                        "  AND s.end_node_id = n.id " +
+                        "  AND NOT ST_Equals(ST_EndPoint(s.geom), n.geom)",
+                taskId, variantId);
+        if (n > 0) {
+            log.info("[{}][{}] snapSegmentEndpoints: {} endpoint fixes",
+                    taskId, variantId, n);
+        }
+        return n;
+    }
+
     /**
-     * V76: Точечное исправление пересечений сегментов (ТЗ 2.1).
+     * V76/V77.4: Точечное исправление пересечений сегментов (ТЗ 2.1).
      * <p>
      * cascadeSplitOverloadedNodes может создать геометрические пересечения
      * из-за смещения узлов на TRUNK_LEN=0.4м. Этот метод находит каждую
@@ -353,9 +420,17 @@ public class PhysicalNetworkService {
      *   <li>НЕ использует ST_Snap — нет сдвига координат на 5 см;</li>
      *   <li>Работает итеративно — каждое пересечение исправляется отдельно.</li>
      * </ul>
+     * <p>
+     * V77.4: добавлен ранний выход, если за итерацию число unresolved пар
+     * не уменьшилось. Без этого цикл при микрозазорах ST_LineSubstring
+     * отрабатывает все 200 итераций впустую, создавая orphan-узлы.
+     * Дополнительно splitSegmentAtPoint теперь стягивает концы новых
+     * сегментов в геометрию узла — основной источник микрозазоров закрыт.
      */
     private int fixCrossings(UUID taskId, String variantId) {
         int total = 0;
+        long prevUnresolved = Long.MAX_VALUE;
+
         for (int iter = 0; iter < 200; iter++) {
             List<Map<String, Object>> cross = jdbc.queryForList(
                     "SELECT a.id AS aid, b.id AS bid, " +
@@ -442,6 +517,23 @@ public class PhysicalNetworkService {
                 dedupParallelSegments(taskId, variantId);
                 total++;
             }
+
+            // V77.4: если за итерацию не удалось уменьшить число unresolved пар —
+            // выходим. Продолжать смысла нет, каждая итерация плодит узлы.
+            Long unresolvedNow = jdbc.queryForObject(
+                    "SELECT count(*) FROM physical_segment a " +
+                            "JOIN physical_segment b ON a.task_id = b.task_id " +
+                            "  AND a.variant_id = b.variant_id AND a.id < b.id " +
+                            "WHERE a.task_id = ? AND a.variant_id = ? " +
+                            "  AND ST_Intersects(a.geom, b.geom) " +
+                            "  AND NOT ST_Touches(a.geom, b.geom)",
+                    Long.class, taskId, variantId);
+            if (unresolvedNow != null && unresolvedNow >= prevUnresolved) {
+                log.warn("[{}][{}] fixCrossings: stuck at {} unresolved pairs — breaking",
+                        taskId, variantId, unresolvedNow);
+                break;
+            }
+            prevUnresolved = unresolvedNow;
         }
         return total;
     }
@@ -479,7 +571,6 @@ public class PhysicalNetworkService {
     private void splitSegmentAtPoint(UUID taskId, String variantId,
                                      long segId, long nodeId,
                                      double ix, double iy) {
-        // Найти долю линии, на которой находится ближайшая точка к (ix, iy)
         Double frac = jdbc.queryForObject(
                 "SELECT ST_LineLocatePoint(geom, " +
                         "  ST_SetSRID(ST_MakePoint(?, ?), 32637)) " +
@@ -487,20 +578,30 @@ public class PhysicalNetworkService {
                 Double.class, ix, iy, segId);
 
         if (frac == null || frac < 0.001 || frac > 0.999) {
-            // Точка слишком близко к концу — разрез не нужен,
-            // просто перепривязываем конец к новому узлу
+            // Точка слишком близко к концу. Не разрезаем — только переназначаем
+            // node_id и стягиваем тот конец, что уже рядом, в геометрию узла.
             jdbc.update(
                     "UPDATE physical_segment SET " +
                             "  start_node_id = CASE WHEN ST_DWithin(ST_StartPoint(geom), " +
                             "    ST_SetSRID(ST_MakePoint(?, ?), 32637), 1.0) THEN ? ELSE start_node_id END, " +
-                            "  end_node_id = CASE WHEN ST_DWithin(ST_EndPoint(geom), " +
-                            "    ST_SetSRID(ST_MakePoint(?, ?), 32637), 1.0) THEN ? ELSE end_node_id END " +
+                            "  end_node_id   = CASE WHEN ST_DWithin(ST_EndPoint(geom), " +
+                            "    ST_SetSRID(ST_MakePoint(?, ?), 32637), 1.0) THEN ? ELSE end_node_id END, " +
+                            "  geom = CASE " +
+                            "    WHEN ST_DWithin(ST_StartPoint(geom), " +
+                            "         ST_SetSRID(ST_MakePoint(?, ?), 32637), 1.0) " +
+                            "      THEN ST_SetPoint(geom, 0, ST_SetSRID(ST_MakePoint(?, ?), 32637)) " +
+                            "    WHEN ST_DWithin(ST_EndPoint(geom), " +
+                            "         ST_SetSRID(ST_MakePoint(?, ?), 32637), 1.0) " +
+                            "      THEN ST_SetPoint(geom, ST_NumPoints(geom) - 1, ST_SetSRID(ST_MakePoint(?, ?), 32637)) " +
+                            "    ELSE geom END " +
                             "WHERE id = ?",
-                    ix, iy, nodeId, ix, iy, nodeId, segId);
+                    ix, iy, nodeId, ix, iy, nodeId,
+                    ix, iy, ix, iy, ix, iy, ix, iy,
+                    segId);
             return;
         }
 
-        // Вставить две новые части с наследованием атрибутов
+        // Разрезаем: INSERT двух частей, DELETE оригинала.
         jdbc.update(
                 "INSERT INTO physical_segment " +
                         "  (task_id, variant_id, start_node_id, end_node_id, " +
@@ -519,8 +620,26 @@ public class PhysicalNetworkService {
                 nodeId, frac, frac, segId,
                 nodeId, frac, frac, segId);
 
-        // Удалить оригинальный сегмент
         jdbc.update("DELETE FROM physical_segment WHERE id = ?", segId);
+
+        // V77.4: ST_LineSubstring даёт endpoint с погрешностью ~1e-9 м
+        // относительно ST_MakePoint(ix, iy), использованного для узла.
+        // Без snap ST_Touches ломается, и fixCrossings уходит в цикл.
+        // Стягиваем начало всех сегментов, стартующих в новом узле,
+        // и конец всех, заканчивающихся в нём.
+        jdbc.update(
+                "UPDATE physical_segment SET " +
+                        "  geom = ST_SetPoint(geom, 0, ST_SetSRID(ST_MakePoint(?, ?), 32637)), " +
+                        "  length_m = ST_Length(ST_SetPoint(geom, 0, ST_SetSRID(ST_MakePoint(?, ?), 32637))) " +
+                        "WHERE task_id = ? AND variant_id = ? AND start_node_id = ?",
+                ix, iy, ix, iy, taskId, variantId, nodeId);
+
+        jdbc.update(
+                "UPDATE physical_segment SET " +
+                        "  geom = ST_SetPoint(geom, ST_NumPoints(geom) - 1, ST_SetSRID(ST_MakePoint(?, ?), 32637)), " +
+                        "  length_m = ST_Length(ST_SetPoint(geom, ST_NumPoints(geom) - 1, ST_SetSRID(ST_MakePoint(?, ?), 32637))) " +
+                        "WHERE task_id = ? AND variant_id = ? AND end_node_id = ?",
+                ix, iy, ix, iy, taskId, variantId, nodeId);
     }
 
     // ====================================================================

@@ -51,7 +51,7 @@ public class TieInCoordinationService {
             this.remaining = remaining;
         }
 
-        public long groupOf(long targetVertexId) {              // ← было private
+        public long groupOf(long targetVertexId) {
             return targetToGroup.getOrDefault(targetVertexId, targetVertexId);
         }
 
@@ -59,8 +59,17 @@ public class TieInCoordinationService {
             return remaining.getOrDefault(groupOf(targetVertexId), 0);
         }
 
-        public int remainingForGroup(long groupId) {            // ← НОВЫЙ метод
+        public int remainingForGroup(long groupId) {
             return remaining.getOrDefault(groupId, 0);
+        }
+
+        /** V72: список всех target-вершин группы (для multi-target Dijkstra). */
+        public List<Long> targetsOfGroup(long groupId) {
+            List<Long> result = new ArrayList<>();
+            for (Map.Entry<Long, Long> e : targetToGroup.entrySet()) {
+                if (e.getValue() == groupId) result.add(e.getKey());
+            }
+            return result;
         }
 
         public void consume(long targetVertexId) {
@@ -74,6 +83,19 @@ public class TieInCoordinationService {
         public CapacityState copy() {
             return new CapacityState(new HashMap<>(targetToGroup), new HashMap<>(remaining));
         }
+    }
+
+    /**
+     * V72: результат SSP с группировкой для multi-target Dijkstra.
+     */
+    public static class SspResult {
+        /** OKS → выбранный путь (как раньше). */
+        public final Map<Long, PathResult> assigned = new LinkedHashMap<>();
+
+        /** group_id → список OKS, назначенных на эту группу. */
+        public final Map<Long, List<Long>> byTargetGroup = new LinkedHashMap<>();
+
+        public boolean isEmpty() { return assigned.isEmpty(); }
     }
 
     // ==========================================================================
@@ -183,8 +205,8 @@ public class TieInCoordinationService {
     // v1: individual = SSP без cost-shift
     // ==========================================================================
 
-    public Map<Long, PathResult> assignIndividual(Map<Long, List<PathResult>> allPaths,
-                                                  CapacityState state) {
+    public SspResult assignIndividual(Map<Long, List<PathResult>> allPaths,
+                                      CapacityState state) {
         return runSsp(allPaths, state, Collections.emptyMap());
     }
 
@@ -197,31 +219,18 @@ public class TieInCoordinationService {
      * preferred targets дешевле в COST_SHIFT_FACTOR раз. SSP максимизирует
      * flow (все OKS будут назначены, если feasible), среди оптимумов
      * предпочитает shared target.
-     *
-     * @param oksGroup         группа OKS (все OKS кластера)
-     * @param allPaths         пути
-     * @param state            capacity
-     * @param preferredTargets targets, к которым хотим стянуть OKS
-     */
-    public Map<Long, PathResult> assignShared(Set<Long> oksGroup,
-                                              Map<Long, List<PathResult>> allPaths,
-                                              CapacityState state,
-                                              Set<Long> preferredTargets) {
-        // Если preferred пусто — просто SSP без сдвига.
+     **/
+    public SspResult assignShared(Set<Long> oksGroup,
+                                  Map<Long, List<PathResult>> allPaths,
+                                  CapacityState state,
+                                  Set<Long> preferredTargets) {
         if (preferredTargets == null || preferredTargets.isEmpty()) {
             return runSsp(allPaths, state, Collections.emptyMap());
         }
-
-        // Считаем shared target для группы: покрытие + сумма cost.
-        // pickSharedTargetForGroup теперь возвращает один target.
-        // Может случиться, что preferredTargets содержит уже выбранный shared.
-        // Оставим эту логику на вызывающей стороне: она передаёт preferredTargets.
-
         Map<Long, Double> shift = new HashMap<>();
         for (Long t : preferredTargets) {
             shift.put(t, COST_SHIFT_FACTOR);
         }
-
         return runSsp(allPaths, state, shift);
     }
 
@@ -268,11 +277,11 @@ public class TieInCoordinationService {
     // v3: sub-split через SSP с двумя preferred targets
     // ==========================================================================
 
-    public Map<Long, PathResult> assignSubSplit(List<Long> oksVertexIds,
-                                                Map<Long, List<PathResult>> allPaths,
-                                                CapacityState state,
-                                                Map<Long, Double> oksX,
-                                                Set<Long> preferredTargets) {
+    public SspResult assignSubSplit(List<Long> oksVertexIds,
+                                    Map<Long, List<PathResult>> allPaths,
+                                    CapacityState state,
+                                    Map<Long, Double> oksX,
+                                    Set<Long> preferredTargets) {
         if (oksVertexIds.size() < 4) {
             return runSsp(allPaths, state,
                     preferredTargets == null ? Collections.emptyMap() : shiftMap(preferredTargets));
@@ -292,32 +301,23 @@ public class TieInCoordinationService {
     // ==========================================================================
 
     /**
-     * @param costShift если содержит target — умножаем его cost на это значение
-     *                  (в диапазоне (0, 1)); иначе cost без изменений.
-     */
-    /**
-     * SSP-ядро: строит потоковую сеть source → OKS → target → sink.
+     * SSP-ядро: source → OKS → target → sink.
      *
-     * V64: каждый target получает собственное ребро к sink с capacity = remaining(target).
-     * Если несколько target принадлежат одной группе (например, edge projections
-     * одной камеры), capacity группы фактически дублируется по числу target —
-     * это осознанное решение: физический слой (V53 + V69) разрулит перегруз,
-     * а SSP получает свободу для сохранения связности 17/17.
-     *
-     * @param costShift если содержит target — умножаем его cost на это значение
-     *                  (в диапазоне (0, 1)); иначе cost без изменений.
+     * V72: возвращает {@link SspResult} — назначения + группировку OKS по
+     * target-group. Группировка нужна, чтобы после SSP перестроить пути через
+     * multi-target Dijkstra (find_shared_paths_from_group).
      */
-    private Map<Long, PathResult> runSsp(Map<Long, List<PathResult>> allPaths,
-                                         CapacityState state,
-                                         Map<Long, Double> costShift) {
-        if (allPaths.isEmpty()) return new LinkedHashMap<>();
+    private SspResult runSsp(Map<Long, List<PathResult>> allPaths,
+                             CapacityState state,
+                             Map<Long, Double> costShift) {
+        if (allPaths.isEmpty()) return new SspResult();
 
         List<Long> oksList = new ArrayList<>(allPaths.keySet());
         Set<Long> targetsSet = new HashSet<>();
         for (List<PathResult> paths : allPaths.values()) {
             for (PathResult p : paths) targetsSet.add(p.getToVertex());
         }
-        if (targetsSet.isEmpty()) return new LinkedHashMap<>();
+        if (targetsSet.isEmpty()) return new SspResult();
         List<Long> targetList = new ArrayList<>(targetsSet);
 
         Map<Long, Integer> oksIndex = new HashMap<>();
@@ -339,7 +339,7 @@ public class TieInCoordinationService {
         // source → OKS (cap=1)
         for (int i = 0; i < n; i++) addEdge(graph, sourceNode, oksBase + i, 1, 0L);
 
-        // target → sink (cap = remaining(target); группа эмулируется дублированием)
+        // target → sink (cap = remaining(target))
         for (int j = 0; j < m; j++) {
             long targetId = targetList.get(j);
             int cap = state.remaining(targetId);
@@ -415,8 +415,10 @@ public class TieInCoordinationService {
             totalFlow++;
         }
 
-        // Извлечение результатов
-        Map<Long, PathResult> result = new LinkedHashMap<>();
+        // Извлечение результатов + группировка по target-group
+        SspResult sspResult = new SspResult();
+        Map<Long, PathResult> result = sspResult.assigned;
+
         for (int i = 0; i < n; i++) {
             Long oks = oksList.get(i);
             int oksNode = oksBase + i;
@@ -430,6 +432,10 @@ public class TieInCoordinationService {
                 if (path != null && !result.containsKey(oks)) {
                     result.put(oks, path);
                     state.consume(target);
+                    long group = state.groupOf(target);
+                    sspResult.byTargetGroup
+                            .computeIfAbsent(group, k -> new ArrayList<>())
+                            .add(oks);
                 }
             }
         }
@@ -442,10 +448,11 @@ public class TieInCoordinationService {
             log.warn("SSP: {} OKS unconnected due to exhausted capacity: {}",
                     unconnected.size(), unconnected);
         } else {
-            log.debug("SSP: назначено {} из {} OKS (flow={})", result.size(), n, totalFlow);
+            log.debug("SSP: назначено {} из {} OKS (flow={}), {} target-групп",
+                    result.size(), n, totalFlow, sspResult.byTargetGroup.size());
         }
 
-        return result;
+        return sspResult;
     }
 
     // ==========================================================================
@@ -483,5 +490,61 @@ public class TieInCoordinationService {
             if (p.getToVertex() == targetLong) return p;
         }
         return null;
+    }
+
+    // ==========================================================================
+    // V79: pickSharedTarget без учёта capacity
+    // ==========================================================================
+
+    /**
+     * V79: выбор shared target без учёта capacity.
+     *
+     * <p>Используется для v2/v3, когда нужно посадить как можно больше OKS
+     * на одну врезку. Capacity существующей камеры (=4) игнорируется:
+     * по разъяснению 11 ТЗ, если существующая камера не выдерживает
+     * примыканий, в её точке создаётся НОВАЯ камера. Физический слой
+     * (cascadeSplitOverloadedNodes + split_oversized_chambers) разрежет
+     * перегруженный узел.
+     *
+     * <p>Возвращает target_vertex_id с максимальным покрытием OKS;
+     * при равенстве покрытия — с минимальной суммой стоимости путей.
+     * Возвращает null, если ни одна OKS не имеет путей.
+     */
+    public Long pickSharedTargetIgnoringCapacity(
+            Set<Long> oksGroup,
+            Map<Long, List<PathResult>> allPaths) {
+
+        Map<Long, Integer> coverage = new HashMap<>();
+        Map<Long, Double> sumCost = new HashMap<>();
+
+        for (Long oks : oksGroup) {
+            List<PathResult> paths = allPaths.get(oks);
+            if (paths == null) continue;
+            for (PathResult p : paths) {
+                long t = p.getToVertex();
+                coverage.merge(t, 1, Integer::sum);
+                sumCost.merge(t, p.getTotalCost(), Double::sum);
+            }
+        }
+
+        if (coverage.isEmpty()) return null;
+
+        Long best = null;
+        int bestCover = -1;
+        double bestSum = Double.MAX_VALUE;
+        for (Map.Entry<Long, Integer> e : coverage.entrySet()) {
+            long t = e.getKey();
+            int cov = e.getValue();
+            double sum = sumCost.getOrDefault(t, Double.MAX_VALUE);
+            if (cov > bestCover || (cov == bestCover && sum < bestSum)) {
+                best = t;
+                bestCover = cov;
+                bestSum = sum;
+            }
+        }
+
+        log.info("pickSharedTargetIgnoringCapacity: target={} covers {}/{} OKS (sumCost={})",
+                best, bestCover, oksGroup.size(), String.format("%.1f", bestSum));
+        return best;
     }
 }
