@@ -81,6 +81,18 @@ public class HybridVisibilityGraphService {
         log.info("[{}] Cluster {}: {} escape points added in {} ms",
                 taskId, clusterId, escapePointsAdded, escapeElapsed);
 
+        // ===== 2.5 V78.2: пометить ВСЕ рёбра кластера (включая созданные
+        //       escape points) как special при пересечении с heat_network.
+        //       Вызов ПОСЛЕ addEscapePoints, иначе вторая волна рёбер
+        //       не проходит через предикат и остаётся base. =====
+        Integer marked = jdbc.queryForObject(
+                "SELECT mark_heat_network_special(?, ?)",
+                Integer.class, taskId, clusterId);
+        if (marked != null && marked > 0) {
+            log.info("[{}] Cluster {}: marked {} visibility edges crossing heat_network as special",
+                    taskId, clusterId, marked);
+        }
+        
         // ===== 3. Извлекаем рёбра для JTS валидации =====
         long startExtract = System.currentTimeMillis();
         List<EdgeToValidate> edgesToValidate = extractEdgesForValidation(taskId, clusterId);
