@@ -314,6 +314,7 @@ public class TaskService {
             TieInCoordinationService.CapacityState capV3 = baseCap.copy();
 
             // Второй проход: назначаем с общей capacity-картой на вариант.
+// Второй проход: назначаем с общей capacity-картой на вариант.
             for (ClusterPaths cp : clusterPathsList) {
                 int clusterId = cp.cluster.getClusterId();
 
@@ -324,6 +325,11 @@ public class TaskService {
                         id, clusterId, cp.oksVertexIds, sspV1, capV1);
 
                 // v2: shared target для всего кластера
+                Long sharedAll = tieInCoordinationService.pickSharedTarget(
+                        new HashSet<>(cp.oksVertexIds), cp.allPaths, capV2);
+                Set<Long> preferredV2 = sharedAll == null
+                        ? Collections.emptySet()
+                        : Collections.singleton(sharedAll);
                 TieInCoordinationService.SspResult sspV2 =
                         tieInCoordinationService.assignShared(
                                 new HashSet<>(cp.oksVertexIds), cp.allPaths, capV2, preferredV2);
@@ -333,10 +339,30 @@ public class TaskService {
                 // v3: два shared target (sub-split по X)
                 Map<Long, PathResult> v3;
                 if (cp.oksVertexIds.size() >= 4) {
+                    Map<Long, Double> oksX = new HashMap<>();
+                    jdbcTemplate.query(
+                            "SELECT id, ST_X(geom) AS x FROM visibility_vertex " +
+                                    "WHERE task_id = ? AND cluster_id = ? AND vertex_type = 'oks'",
+                            rs -> { oksX.put(rs.getLong("id"), rs.getDouble("x")); },
+                            id, clusterId);
+
+                    List<Long> sorted = new ArrayList<>(cp.oksVertexIds);
+                    sorted.sort(Comparator.comparingDouble(oksX::get));
+                    int mid = sorted.size() / 2;
+                    Set<Long> groupA = new HashSet<>(sorted.subList(0, mid));
+                    Set<Long> groupB = new HashSet<>(sorted.subList(mid, sorted.size()));
+
+                    Long sharedA = tieInCoordinationService.pickSharedTarget(groupA, cp.allPaths, capV3);
+                    Long sharedB = tieInCoordinationService.pickSharedTarget(groupB, cp.allPaths, capV3);
+                    Set<Long> preferredV3 = new HashSet<>();
+                    if (sharedA != null) preferredV3.add(sharedA);
+                    if (sharedB != null && !sharedB.equals(sharedA)) preferredV3.add(sharedB);
+
                     TieInCoordinationService.SspResult sspV3 =
                             tieInCoordinationService.assignSubSplit(
                                     cp.oksVertexIds, cp.allPaths, capV3, oksX, preferredV3);
-                    v3 = rebuildSharedPaths(id, clusterId, cp.oksVertexIds, sspV3, capV3);
+                    v3 = rebuildSharedPaths(
+                            id, clusterId, cp.oksVertexIds, sspV3, capV3);
                 } else {
                     v3 = new LinkedHashMap<>(v1);
                 }
