@@ -65,6 +65,23 @@ public class PhysicalNetworkService {
             r = recount(taskId, variantId);
         }
 
+        // V78: чистка висячих стубов.
+        // Выполняется для ВСЕХ вариантов, не только тех, где был prune.
+        List<Map<String, Object>> cleanup = jdbc.queryForList(
+                "SELECT * FROM cleanup_terminal_stubs(?, ?)", taskId, variantId);
+        if (!cleanup.isEmpty()) {
+            Map<String, Object> row = cleanup.get(0);
+            int rec = ((Number) row.get("reclassified")).intValue();
+            int delSeg = ((Number) row.get("deleted_segs")).intValue();
+            int delNode = ((Number) row.get("deleted_nodes")).intValue();
+            if (rec > 0 || delSeg > 0 || delNode > 0) {
+                log.info("[{}][{}] cleanup_terminal_stubs: {} reclassified, " +
+                                "{} segments deleted, {} nodes deleted",
+                        taskId, variantId, rec, delSeg, delNode);
+                r = recount(taskId, variantId);
+            }
+        }
+
         // 2. Каскадный сплит перегруженных узлов (degree > 4)
         int cascaded = cascadeSplitOverloadedNodes(taskId, variantId);
         if (cascaded > 0) {
