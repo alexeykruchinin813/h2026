@@ -193,6 +193,7 @@ public class SteinerTreeBuilder {
         try {
             Geometry geom = new WKTReader().read(pathWkt);
             if (!(geom instanceof LineString)) {
+                log.warn("sharpTurnPenalty: geometry is {} not LineString — penalty=0", geom.getGeometryType());
                 // MultiLineString после ST_LineMerge — маловероятно, но не падаем.
                 return 0.0;
             }
@@ -217,6 +218,9 @@ public class SteinerTreeBuilder {
                 if (thetaDeg > 90.0) {
                     total += (thetaDeg - 90.0) * PENALTY_PER_DEGREE;
                 }
+            }
+            if (total > 0) {
+                log.warn("sharpTurnPenalty: {} со штрафом {}", pathWkt.length(), total);
             }
             return total;
         } catch (Exception e) {
