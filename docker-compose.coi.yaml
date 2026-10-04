@@ -1,0 +1,39 @@
+version: '3.7'
+
+services:
+  db:
+    image: "cr.yandex/crpupttrrt05iq8ud254/pgrouting:16-postgis-3.6-pgrouting-4.0.1"
+    container_name: heat-tracer-db
+    environment:
+      POSTGRES_USER: heat_user
+      POSTGRES_PASSWORD: heat_password
+      POSTGRES_DB: heat_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - /home/yc-user/pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U heat_user -d heat_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  app:
+    image: "cr.yandex/crpupttrrt05iq8ud254/heat-tracer-app:latest"
+    container_name: heat-tracer-app
+    ports:
+      - "8080:8080"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://db:5432/heat_db
+      SPRING_DATASOURCE_USERNAME: heat_user
+      SPRING_DATASOURCE_PASSWORD: heat_password
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+x-yc-disks:
+  - device_name: pgdata-disk
+    fs_type: ext4
+    host_path: /home/yc-user/pgdatayc vpc subnet list
